@@ -1,0 +1,13 @@
+/* Keep the core-1 code in the second banked SRAM group.
+ * Core 0 keeps the default RAM region; it already sits in the 0x20000000 bank range.
+ */
+SECTIONS
+{
+    .core1_code : ALIGN(4)
+    {
+        __core1_code_start__ = .;
+        KEEP(*(.time_critical.core1.code))
+        . = ALIGN(4);
+        __core1_code_end__ = .;
+    } > CORE1_RAM
+}

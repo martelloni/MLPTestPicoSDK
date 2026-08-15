@@ -1,0 +1,11 @@
+/* RP2350 layout:
+ * - default RAM (0x20000000..0x2007FFFF) is the normal core-0 SRAM region for the SDK
+ * - explicit bank 4..7 are reserved for core 1 only
+ *
+ * We intentionally do not define a second CORE0_RAM region at 0x20000000 because it would
+ * overlap the default .text/.data layout and trigger linker relocation errors.
+ */
+MEMORY
+{
+    CORE1_RAM(rwx) : ORIGIN = 0x20040000, LENGTH = 256K
+}

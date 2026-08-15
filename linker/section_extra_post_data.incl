@@ -1,0 +1,20 @@
+/* Keep core-1 data in the explicit banked SRAM region.
+ * Core 0 data remains in the default RAM region, which already maps to SRAM0..3.
+ */
+SECTIONS
+{
+    .core1_bank (NOLOAD) : ALIGN(4)
+    {
+        __core1_bank_start__ = .;
+        *(.core1.bank)
+        . = ALIGN(4);
+        __core1_bank_end__ = .;
+    } > CORE1_RAM
+
+    .core1_stack (NOLOAD) : ALIGN(8)
+    {
+        __core1_stack_bottom__ = .;
+        . += 4K;
+        __core1_stack_top__ = .;
+    } > CORE1_RAM
+}
