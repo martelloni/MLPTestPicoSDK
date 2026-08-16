@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Initialise pico_sdk from installed location
@@ -46,8 +46,9 @@ pico_add_linker_script_override_path(MLPTestPicoSDK
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
 
-# no_flash means the target is to run from RAM
-pico_set_binary_type(MLPTestPicoSDK no_flash)
+# Keep the image flash-loadable as a standard UF2: the binary is stored in flash and then
+# copied into RAM at reset, which is the supported Pico model for generated .uf2 images.
+pico_set_binary_type(MLPTestPicoSDK copy_to_ram)
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(MLPTestPicoSDK 0)

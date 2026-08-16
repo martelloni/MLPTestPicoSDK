@@ -16,9 +16,9 @@
  * and SRAM bank 4-7 for core 1 on RP2350.
  */
 #define MEML_RUNS_ON_CORE(n) \
-    __attribute__((section(".time_critical.core" MEML_STR(n) ".code"), used, noinline))
+    __attribute__((section(".time_critical.core" MEML_STR(n) ".code"), used, noinline, optimize("O2")))
 
 #define MEML_DATA_ON_CORE(n) \
-    __attribute__((section(".core" MEML_STR(n) ".bank"), used))
+    __attribute__((section(".core" MEML_STR(n) ".bank"), used, aligned(8)))
 
 #endif // __MEMORY_DEFS_HPP__

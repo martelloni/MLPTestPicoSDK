@@ -56,7 +56,10 @@ set(PICO_SDK_FETCH_FROM_GIT_PATH "${PICO_SDK_FETCH_FROM_GIT_PATH}" CACHE FILEPAT
 set(PICO_SDK_FETCH_FROM_GIT_TAG "${PICO_SDK_FETCH_FROM_GIT_TAG}" CACHE FILEPATH "release tag for SDK")
 
 if (NOT PICO_SDK_PATH)
-    if (PICO_SDK_FETCH_FROM_GIT)
+    if (EXISTS "$ENV{HOME}/.pico-sdk/sdk/2.3.0")
+        set(PICO_SDK_PATH "$ENV{HOME}/.pico-sdk/sdk/2.3.0")
+        message("Using auto-detected Pico SDK path '${PICO_SDK_PATH}'")
+    elseif (PICO_SDK_FETCH_FROM_GIT)
         include(FetchContent)
         set(FETCHCONTENT_BASE_DIR_SAVE ${FETCHCONTENT_BASE_DIR})
         if (PICO_SDK_FETCH_FROM_GIT_PATH)

@@ -1,13 +1,8 @@
-/* Keep the core-1 code in the second banked SRAM group.
- * Core 0 keeps the default RAM region; it already sits in the 0x20000000 bank range.
+/* Keep executable code in the normal flash/XIP + RAM load path. Banked SRAM is reserved
+ * for private data/stack only and must not contain initialized code sections, because the
+ * UF2 format cannot represent executable contents in SRAM as a flash image.
  */
 SECTIONS
 {
-    .core1_code : ALIGN(4)
-    {
-        __core1_code_start__ = .;
-        KEEP(*(.time_critical.core1.code))
-        . = ALIGN(4);
-        __core1_code_end__ = .;
-    } > CORE1_RAM
+    /* Intentionally empty: code remains in the standard .text / flash-backed sections. */
 }
