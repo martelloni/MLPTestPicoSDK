@@ -14,6 +14,7 @@
 #include "MemoryDefs.hpp"
 #include "mlp/StaticLayer.h"
 #include "mlp/StaticMLP.h"
+#include "utils/RAMFlooder.hpp"
 
 namespace test {
 
@@ -22,7 +23,7 @@ class TestRAMIndependence : public TestBase {
 public:
 
     TestRAMIndependence(uint32_t clock_frequency_hz)
-        : TestBase(TestConfig{clock_frequency_hz, 5u, 5u}) {
+        : TestBase(TestConfig{clock_frequency_hz, 5u, 1u}) {
         ConfigureCoreWork(&Core0Init,
                          &Core0Task,
                          &Core1Init,
@@ -48,6 +49,8 @@ private:
     };
 
     inline static MEML_DATA_ON_CORE(0) TestNN core0_nn_{};
+    static constexpr uint32_t core1_ram_flooder_size_ = 1024 * 60; // 240 KB
+    inline static MEML_DATA_ON_CORE(1) utils::RAMFlooder<uint32_t, core1_ram_flooder_size_> core1_ram_flooder_{};
 
     static MEML_RUNS_ON_CORE(0) void Core0Init() {
         core0_nn_.net.SetSeed(0xC0DEu);
@@ -63,20 +66,12 @@ private:
     }
 
     static MEML_RUNS_ON_CORE(1) void Core1Init() {
-        // Set GPIO 33 as out
-        gpio_init(33);
-        gpio_set_dir(33, true);
+        // No init for nows
     }
 
     static MEML_RUNS_ON_CORE(1) void Core1Task() {
         StartMeasurementCore1();
-        // Blink GPIO 33 three times in a second
-        for (unsigned int i = 0; i < 3; ++i) {
-            gpio_put(33, 1);
-            sleep_ms(167);
-            gpio_put(33, 0);
-            sleep_ms(167);
-        }
+        core1_ram_flooder_.FillOnce();
         StopMeasurementCore1();
     }
 
