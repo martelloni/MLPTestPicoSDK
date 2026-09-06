@@ -40,7 +40,10 @@ pico_sdk_init()
 add_executable(MLPTestPicoSDK
         main.cpp
         memory/CoreSectionInit.cpp
-        dataset/Dataset.cpp)
+        dataset/Dataset.cpp
+        tests/unit/UnitTestRunner.cpp
+        tests/unit/SmokeTest.cpp
+        tests/unit/DatasetValidationTest.cpp)
 
 if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
     if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "0" AND NOT MEML_MLP_RUNS_ON_CORE STREQUAL "1")
