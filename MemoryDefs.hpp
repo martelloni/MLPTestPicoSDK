@@ -21,4 +21,8 @@
 #define MEML_DATA_ON_CORE(n) \
     __attribute__((section(".core" MEML_STR(n) ".bank"), used, aligned(8)))
 
+#define MEML_DATA_ON_FLASH \
+    __attribute__((section(".flash"), used, aligned(8)))
+
+
 #endif // __MEMORY_DEFS_HPP__

@@ -1,0 +1,14 @@
+#include "Dataset.hpp"
+#include "MemoryDefs.hpp"
+
+
+namespace dataset {
+
+MEML_DATA_ON_FLASH const std::array<std::array<DataType, kFeatureSize>, kNumExamples> features =
+%FEATURES%
+;
+MEML_DATA_ON_FLASH const std::array<std::array<DataType, kLabelSize>, kNumExamples> labels =
+%LABELS%
+;
+
+};  // namespace dataset
