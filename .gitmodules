@@ -1,3 +1,6 @@
 [submodule "mlp"]
 	path = mlp
 	url = git@github.com:MusicallyEmbodiedML/memlp.git
+[submodule "tests/unit/microunit"]
+	path = tests/unit/microunit
+	url = https://github.com/smiranda/microunit.git

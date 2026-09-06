@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(MLPTestPicoSDK main.cpp )
+add_executable(MLPTestPicoSDK main.cpp dataset/Dataset.cpp)
 
 # Keep the SDK-generated linker script and inject only the custom per-core SRAM sections.
 # This is the supported Pico SDK extension point for custom linker fragments.
