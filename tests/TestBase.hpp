@@ -9,6 +9,7 @@
 #define __TEST_BASE_HPP__
 
 #include <cstdint>
+#include <cstddef>
 #include <algorithm>
 #include <limits>
 
@@ -20,6 +21,11 @@
 #define DEMCR        (*(volatile uint32_t*)0xE000EDFC)
 
 namespace test {
+
+extern "C" {
+extern uint32_t __core1_stack_bottom__[];
+extern uint32_t __core1_stack_top__[];
+}
 
 class TestBase {
 
@@ -89,9 +95,14 @@ public:
         EnableDWT();
         multicore_fifo_drain();
 
-        // Core 1 waits for the start token before beginning init/run, so its work is
-        // completely local to the core-1 SRAM bank and never touches core-0 state.
-        multicore_launch_core1(Core1Entry);
+        // Cortex-M Thumb entry points must have bit 0 set. The linker symbol itself is
+        // emitted as an even address in the ELF, so we have to force the Thumb bit before
+        // handing the function pointer to the ROM launcher.
+        const auto core1_entry = reinterpret_cast<void (*)()>(reinterpret_cast<uintptr_t>(&Core1Entry) | 1u);
+        const std::size_t core1_stack_size =
+            reinterpret_cast<uintptr_t>(__core1_stack_top__) -
+            reinterpret_cast<uintptr_t>(__core1_stack_bottom__);
+        multicore_launch_core1_with_stack(core1_entry, __core1_stack_bottom__, core1_stack_size);
 
         // Synchronise the start as closely as possible without sharing `this`.
         multicore_fifo_push_blocking(0xC1C00001u);
@@ -137,7 +148,7 @@ private:
         }
     }
 
-    static void Core1Entry() {
+    static MEML_RUNS_ON_CORE(1) void Core1Entry() {
         const uint32_t start_token = multicore_fifo_pop_blocking();
         (void)start_token;
         EnableDWT();

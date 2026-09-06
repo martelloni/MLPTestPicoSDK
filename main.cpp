@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "MemoryDefs.hpp"
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"

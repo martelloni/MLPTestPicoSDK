@@ -31,7 +31,7 @@ public:
 protected:
 
 
-}
+};
 
 
 #endif  // __MLP_OPTICAL_RECOGNITION_HPP__

@@ -6,7 +6,8 @@
 #include "MemoryDefs.hpp"
 
 #ifndef RAM_FLOODER_ON_CORE
-#define RAM_FLOODER_ON_CORE    (1)
+// This must be a bare integer token: MEML_RUNS_ON_CORE stringizes it into a linker section name.
+#define RAM_FLOODER_ON_CORE    1
 #endif
 
 

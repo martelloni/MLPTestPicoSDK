@@ -30,12 +30,24 @@ include(pico_sdk_import.cmake)
 
 project(MLPTestPicoSDK C CXX ASM)
 
+set(MEML_MLP_RUNS_ON_CORE "" CACHE STRING "Compile-time MLP placement selector: blank, 0, or 1")
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(MLPTestPicoSDK main.cpp dataset/Dataset.cpp)
+add_executable(MLPTestPicoSDK
+        main.cpp
+        memory/CoreSectionInit.cpp
+        dataset/Dataset.cpp)
+
+if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
+    if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "0" AND NOT MEML_MLP_RUNS_ON_CORE STREQUAL "1")
+        message(FATAL_ERROR "MEML_MLP_RUNS_ON_CORE must be blank, 0, or 1.")
+    endif()
+    target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_MLP_RUNS_ON_CORE=${MEML_MLP_RUNS_ON_CORE})
+endif()
 
 # Keep the SDK-generated linker script and inject only the custom per-core SRAM sections.
 # This is the supported Pico SDK extension point for custom linker fragments.
@@ -45,6 +57,10 @@ pico_add_linker_script_override_path(MLPTestPicoSDK
 
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
+
+# Reserve the default/core-0 SRAM region as 256 KiB so the remaining 256 KiB bank
+# remains dedicated to the selected core-1 layout.
+pico_set_linker_script_var(MLPTestPicoSDK RAM_LENGTH 256k)
 
 # Keep the image flash-loadable as a standard UF2: the binary is stored in flash and then
 # copied into RAM at reset, which is the supported Pico model for generated .uf2 images.
@@ -65,4 +81,3 @@ target_include_directories(MLPTestPicoSDK PRIVATE
 )
 
 pico_add_extra_outputs(MLPTestPicoSDK)
-

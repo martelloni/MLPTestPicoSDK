@@ -1,8 +1,17 @@
-/* Keep executable code in the normal flash/XIP + RAM load path. Banked SRAM is reserved
- * for private data/stack only and must not contain initialized code sections, because the
- * UF2 format cannot represent executable contents in SRAM as a flash image.
+/* Keep the ordinary SDK text path as-is, but add a flash-backed core-1 code section whose
+ * runtime address sits in the dedicated core-1 SRAM bank. The bank itself is a separate
+ * NOLOAD mutable range that must not overlap the copied machine code.
  */
 SECTIONS
 {
-    /* Intentionally empty: code remains in the standard .text / flash-backed sections. */
+    .time_critical.core1.code : ALIGN(8)
+    {
+        __core1_code_start__ = .;
+        *(.time_critical.core1.code)
+        . = ALIGN(8);
+        __core1_code_end__ = .;
+    } > CORE1_RAM AT> FLASH
+
+    __core1_code_load__ = LOADADDR(.time_critical.core1.code);
+    ASSERT((__core1_code_end__ <= 0x2007fff0), "core1 code region exceeds the 256 KiB SRAM bank")
 }

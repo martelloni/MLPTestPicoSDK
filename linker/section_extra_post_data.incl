@@ -1,10 +1,18 @@
-/* Keep only the core-1 banked SRAM as a NOLOAD allocation. Core 0 already owns the
- * default SRAM region on RP2350; forcing it through an extra NOLOAD mapping creates a
- * UF2-invalid initialized-data placement. Any core-private runtime state must be zeroed at
- * start-up rather than stored as flash-backed init data in the bank region.
+/* Keep only the mutable core-1 bank as a NOLOAD allocation. The copied code lives in the
+ * front of the bank, and the banked data/stack begins only after that code range so the
+ * bootstrap can copy code and then safely zero the mutable state without erasing its own
+ * executable payload.
  */
 SECTIONS
 {
+    .flash : ALIGN(8)
+    {
+        __meml_flash_data_start__ = .;
+        *(.flash)
+        . = ALIGN(8);
+        __meml_flash_data_end__ = .;
+    } > FLASH
+
     .core1_bank (NOLOAD) : ALIGN(8)
     {
         __core1_bank_start__ = .;
@@ -19,4 +27,8 @@ SECTIONS
         . += 4K;
         __core1_stack_top__ = .;
     } > CORE1_RAM
+
+    ASSERT((__core1_code_end__ <= __core1_bank_start__), "core1 copied code overlaps the mutable bank region")
+    ASSERT((__core1_bank_end__ <= 0x20080000), "core1 bank overflowed 256 KiB SRAM window")
+    ASSERT((__core1_stack_top__ <= 0x20080000), "core1 stack overflowed 256 KiB SRAM window")
 }
