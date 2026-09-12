@@ -12,11 +12,12 @@ public:
 
     using Net = smlp::StaticMLP<
         dataset::DataType,
-        smlp::Layout<64, 32, 10>,
+        smlp::Layout<64, 64, 32, 10>,
         smlp::Activations<
             ACTIVATION_FUNCTIONS::RELU,
             ACTIVATION_FUNCTIONS::RELU,
-            ACTIVATION_FUNCTIONS::SIGMOID>>;
+            ACTIVATION_FUNCTIONS::LINEAR>,
+        loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>;
 
     struct Result {
         float loss;

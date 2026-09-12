@@ -44,7 +44,9 @@ add_executable(MLPTestPicoSDK
         tests/unit/UnitTestRunner.cpp
         tests/unit/SmokeTest.cpp
         tests/unit/DatasetValidationTest.cpp
-        tests/unit/MLPPlacementTest.cpp)
+        tests/unit/MLPPlacementTest.cpp
+        tests/unit/SoftmaxTest.cpp
+        tests/unit/LossTest.cpp)
 
 if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
     if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "0" AND NOT MEML_MLP_RUNS_ON_CORE STREQUAL "1")
