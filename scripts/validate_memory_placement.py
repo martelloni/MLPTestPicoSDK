@@ -151,10 +151,12 @@ def check_mlp_symbol_placement(symbols, core, errors):
 
 def check_placement_probe(symbols, core, errors):
     expected_lo, expected_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
-    wanted = ("g_placement_probe", "PlacementProbeCodeAddress")
+    # MLPOpticalRecognitionTest.cpp's g_experiment is the real experiment's
+    # State placement probe, repurposed from Step 1.5's retired MLPPlacementTest.
+    wanted = ("g_experiment",)
     found = [(addr, name) for addr, name in symbols if any(w in name for w in wanted)]
     if not found:
-        fail(errors, "MLPPlacementTest symbols not found in the ELF -- was it linked in?")
+        fail(errors, "MLPOpticalRecognitionTest symbols not found in the ELF -- was it linked in?")
         return
     for addr, name in found:
         if not (expected_lo <= addr < expected_hi):
