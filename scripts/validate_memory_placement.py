@@ -153,6 +153,10 @@ def check_placement_probe(symbols, core, errors):
     expected_lo, expected_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
     # MLPOpticalRecognitionTest.cpp's g_experiment is the real experiment's
     # State placement probe, repurposed from Step 1.5's retired MLPPlacementTest.
+    # Only linked into "tests" builds (RUN_TESTS_OR_BENCHMARKS=tests); a
+    # "benchmarks" build never compiles this translation unit, so the caller
+    # skips this check entirely for that mode rather than treating its
+    # absence as a regression.
     wanted = ("g_experiment",)
     found = [(addr, name) for addr, name in symbols if any(w in name for w in wanted)]
     if not found:
@@ -173,6 +177,11 @@ def main():
     parser.add_argument("--core", default="", help="MEML_MLP_RUNS_ON_CORE value: '', '0', or '1'")
     parser.add_argument("--readelf", default="arm-none-eabi-readelf")
     parser.add_argument("--nm", default="arm-none-eabi-nm")
+    parser.add_argument(
+        "--mode", default="tests", choices=("tests", "benchmarks"),
+        help="RUN_TESTS_OR_BENCHMARKS value: 'tests' links MLPOpticalRecognitionTest.cpp's "
+             "g_experiment placement probe; 'benchmarks' does not, so that check is skipped.",
+    )
     args = parser.parse_args()
 
     sections = parse_sections(run(args.readelf, ["-SW", args.elf]))
@@ -184,7 +193,8 @@ def main():
         check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
     check_flash_outside_ram(sections, errors)
     check_mlp_symbol_placement(symbols, args.core, errors)
-    check_placement_probe(symbols, args.core, errors)
+    if args.mode == "tests":
+        check_placement_probe(symbols, args.core, errors)
 
     if errors:
         print(f"validate_memory_placement: FAIL ({len(errors)} issue(s)) "

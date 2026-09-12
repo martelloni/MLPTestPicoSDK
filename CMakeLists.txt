@@ -32,14 +32,29 @@ project(MLPTestPicoSDK C CXX ASM)
 
 set(MEML_MLP_RUNS_ON_CORE "" CACHE STRING "Compile-time MLP placement selector: blank, 0, or 1")
 
+# RAM is scarce on this target (a single 256 KiB copy_to_ram window shared by
+# both a full microunit suite and the RAM-independence benchmark's own
+# hardcoded network), so the two are mutually exclusive build modes rather
+# than both always being linked in. "tests" compiles and runs the unit-test
+# suite only; "benchmarks" skips every unit-test translation unit and builds
+# the benchmark suite (currently TestRAMIndependence only) instead.
+set(RUN_TESTS_OR_BENCHMARKS "tests" CACHE STRING "Build mode: 'tests' builds/runs the unit-test suite only; 'benchmarks' skips unit tests and builds the benchmark suite instead")
+set_property(CACHE RUN_TESTS_OR_BENCHMARKS PROPERTY STRINGS tests benchmarks)
+if(NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "tests" AND NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks")
+    message(FATAL_ERROR "RUN_TESTS_OR_BENCHMARKS must be 'tests' or 'benchmarks'.")
+endif()
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(MLPTestPicoSDK
+set(MLPTestPicoSDK_SOURCES
         main.cpp
-        memory/CoreSectionInit.cpp
+        memory/CoreSectionInit.cpp)
+
+if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
+    list(APPEND MLPTestPicoSDK_SOURCES
         dataset/Dataset.cpp
         experiments/MLPOpticalRecognition.cpp
         tests/unit/UnitTestRunner.cpp
@@ -49,12 +64,21 @@ add_executable(MLPTestPicoSDK
         tests/unit/LossTest.cpp
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
+endif()
+
+add_executable(MLPTestPicoSDK ${MLPTestPicoSDK_SOURCES})
 
 if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
     if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "0" AND NOT MEML_MLP_RUNS_ON_CORE STREQUAL "1")
         message(FATAL_ERROR "MEML_MLP_RUNS_ON_CORE must be blank, 0, or 1.")
     endif()
     target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_MLP_RUNS_ON_CORE=${MEML_MLP_RUNS_ON_CORE})
+endif()
+
+if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
+    target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_RUN_UNIT_TESTS)
+else()
+    target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
 endif()
 
 # Keep the SDK-generated linker script and inject only the custom per-core SRAM sections.
@@ -101,5 +125,6 @@ add_custom_command(TARGET MLPTestPicoSDK POST_BUILD
                 --core "${MEML_MLP_RUNS_ON_CORE}"
                 --readelf ${CMAKE_READELF}
                 --nm ${CMAKE_NM}
+                --mode ${RUN_TESTS_OR_BENCHMARKS}
         COMMENT "Validating core-0/core-1 memory placement"
         VERBATIM)

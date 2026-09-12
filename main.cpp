@@ -3,19 +3,25 @@
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
-#include "tests/unit/UnitTestRunner.hpp"
 
-// Excluded by default (define MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK to bring it
-// back for a standalone build): this benchmark's own hardcoded core-0 network
-// (~82 KiB via MEML_DATA_ON_CORE(0)) and MLPOpticalRecognition's real 64-64-32-10
-// experiment state (~98 KiB, always linked into this target from Step 4 onward)
-// together overflow the fixed 256 KiB copy_to_ram RAM window -- a window whose
-// size does not depend on MEML_MLP_RUNS_ON_CORE, so this conflict is not specific
-// to any one selector value. It was previously also excluded specifically for
-// MEML_MLP_RUNS_ON_CORE == 1, since the shared mlp/ hot-path code hook
-// (SMLP_CODE_ATTR) would route this core-0-only network's code into the core-1
-// bank while its state stayed on core 0; that reason still applies whenever this
-// benchmark is re-enabled for a core-1 build.
+// Set by CMake's RUN_TESTS_OR_BENCHMARKS="tests": builds and runs the unit-test
+// suite. Mutually exclusive with MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK below --
+// this benchmark's own hardcoded core-0 network (~82 KiB via MEML_DATA_ON_CORE(0))
+// and MLPOpticalRecognition's real 64-64-32-10 experiment state (~98 KiB, used by
+// the unit-test suite from Step 4 onward) together overflow the fixed 256 KiB
+// copy_to_ram RAM window -- a window whose size does not depend on
+// MEML_MLP_RUNS_ON_CORE, so this conflict is not specific to any one selector
+// value. It was previously also a problem specifically for MEML_MLP_RUNS_ON_CORE
+// == 1, since the shared mlp/ hot-path code hook (SMLP_CODE_ATTR) would route
+// this core-0-only network's code into the core-1 bank while its state stayed on
+// core 0; that reason still applies whenever the benchmark shares a build with a
+// core-1-pinned MLP.
+#if defined(MEML_RUN_UNIT_TESTS)
+#include "tests/unit/UnitTestRunner.hpp"
+#endif
+
+// Set by CMake's RUN_TESTS_OR_BENCHMARKS="benchmarks": skips unit tests and
+// builds the benchmark suite (currently TestRAMIndependence only) instead.
 #if defined(MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
 #include "tests/TestRAMIndependence.hpp"
 #endif
@@ -35,6 +41,7 @@ int main()
         tight_loop_contents();
     }
 
+#if defined(MEML_RUN_UNIT_TESTS)
     const bool unit_suite_passed = test::unit::RunAllOnSelectedCore();
     printf("Microunit suite result: %s\n", unit_suite_passed ? "PASS" : "FAIL");
     if (!unit_suite_passed) {
@@ -43,6 +50,7 @@ int main()
             tight_loop_contents();
         }
     }
+#endif
 
 #if defined(MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
     printf("Press any key to start benchmarks...\n");

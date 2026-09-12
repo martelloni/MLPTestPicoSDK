@@ -5,17 +5,19 @@
  * Repurposes the placement guarantees MLPPlacementTest.cpp (Step 1.5) proved
  * with a standalone probe: the same core/address checks now run against the
  * real experiment's State instead of a throwaway fixture, so the two do not
- * both consume reserved-bank budget. Full-dataset, many-epoch smoke training
- * (the 20/100-epoch acceptance runs) is deliberately left to Step 5's named
- * Pico integration tests, not this default microunit suite: the single
- * short training call here (epochs=0 and epochs=1) keeps interactive,
- * USB-driven unit runs short.
+ * both consume reserved-bank budget. Most cases keep training calls short
+ * (epochs=0 and epochs=1) so interactive, USB-driven unit runs stay quick;
+ * MLPOpticalRecognitionTrainingSmokeTest below is the exception, running the
+ * full 20-epoch deterministic acceptance contract from
+ * plan-mlpCoreLocalPrompt.md as part of this same suite, on whichever core it
+ * is compiled/run for.
  */
 
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 #include "pico.h"
 
@@ -73,6 +75,39 @@ UNIT(MLPOpticalRecognitionPredictReturnsValidClass) {
     g_experiment.Initialise(kSeed);
     const uint32_t predicted = g_experiment.Predict(dataset::features[0]);
     ASSERT_TRUE(predicted < dataset::kLabelSize);
+    PASS();
+}
+
+UNIT(MLPOpticalRecognitionTrainingSmokeTest) {
+    // Deterministic acceptance contract from plan-mlpCoreLocalPrompt.md's
+    // "Verification contract": seed 0xC0DEu, RMSProp, lr=0.01, batch size 128
+    // (fixed inside Train()), 20 epochs over the full flash-resident dataset.
+    // Require final mean loss <= 70% of the untrained initial mean loss and
+    // training accuracy >= 80%. Runs on whichever core the suite executes on
+    // (core 0 for unpinned/core-0 builds, the core-1 trampoline otherwise),
+    // since it reuses the already-core-pinned g_experiment fixture above.
+    constexpr uint32_t kSmokeEpochs = 20u;
+    constexpr float kLearningRate = 0.01f;
+    constexpr float kMaxLossRatio = 0.70f;
+    constexpr float kMinAccuracy = 0.80f;
+
+    g_experiment.Initialise(kSeed);
+    // epochs=0 performs no weight update, so this reports the untrained
+    // initial loss/accuracy baseline without perturbing the seeded weights.
+    const MLPOpticalRecognition::Result initial = g_experiment.Train(/*epochs=*/0, kLearningRate);
+    const MLPOpticalRecognition::Result final_result = g_experiment.Train(kSmokeEpochs, kLearningRate);
+
+    // Print loss/accuracy over stdio/UART at test end regardless of outcome,
+    // so a hardware run always leaves a serial record even on failure.
+    std::printf(
+        "MLPOpticalRecognitionTrainingSmokeTest: initial_loss=%f final_loss=%f final_accuracy=%f\n",
+        static_cast<double>(initial.loss), static_cast<double>(final_result.loss),
+        static_cast<double>(final_result.accuracy));
+
+    ASSERT_TRUE(std::isfinite(initial.loss) && initial.loss > 0.0f);
+    ASSERT_TRUE(std::isfinite(final_result.loss));
+    ASSERT_TRUE(final_result.loss <= kMaxLossRatio * initial.loss);
+    ASSERT_TRUE(final_result.accuracy >= kMinAccuracy);
     PASS();
 }
 
