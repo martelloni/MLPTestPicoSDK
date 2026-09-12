@@ -7,7 +7,12 @@ SECTIONS
     .time_critical.core1.code : ALIGN(8)
     {
         __core1_code_start__ = .;
-        *(.time_critical.core1.code)
+        /* Wildcard, not an exact-name match: MEML_RUNS_ON_CORE_CODE(1)/
+         * MEML_RUNS_ON_CORE(1) give every tagged function its own
+         * ".time_critical.core1.code.<N>" section (see MemoryDefs.hpp) so
+         * that weak/COMDAT functions sharing this prefix can't get folded
+         * into one another's COMDAT group and collaterally discarded. */
+        *(.time_critical.core1.code*)
         . = ALIGN(8);
         __core1_code_end__ = .;
     } > CORE1_RAM AT> FLASH

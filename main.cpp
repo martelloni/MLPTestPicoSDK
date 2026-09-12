@@ -23,10 +23,10 @@ int main()
     static constexpr uint32_t clock_frequency_hz = 125000000u; // 125 MHz
     set_sys_clock_khz(clock_frequency_hz / 1000, true);
 
-    printf("Press any key to continue...\n");
     while (stdio_usb_connected() == false) {
         tight_loop_contents();
     }
+    printf("Press any key to continue...\n");
     while (getchar_timeout_us((int64_t)-1) == PICO_ERROR_TIMEOUT) {
         tight_loop_contents();
     }
@@ -34,7 +34,7 @@ int main()
     const bool unit_suite_passed = test::unit::RunAllOnSelectedCore();
     printf("Microunit suite result: %s\n", unit_suite_passed ? "PASS" : "FAIL");
     if (!unit_suite_passed) {
-        printf("Microunit suite failed; halting before benchmarks.\n");
+        printf("Microunit suite failed; halting before benchmarks. SAD TROMBONE!\n");
         while (true) {
             tight_loop_contents();
         }
