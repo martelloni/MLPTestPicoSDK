@@ -43,7 +43,8 @@ add_executable(MLPTestPicoSDK
         dataset/Dataset.cpp
         tests/unit/UnitTestRunner.cpp
         tests/unit/SmokeTest.cpp
-        tests/unit/DatasetValidationTest.cpp)
+        tests/unit/DatasetValidationTest.cpp
+        tests/unit/MLPPlacementTest.cpp)
 
 if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
     if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "0" AND NOT MEML_MLP_RUNS_ON_CORE STREQUAL "1")
@@ -84,3 +85,17 @@ target_include_directories(MLPTestPicoSDK PRIVATE
 )
 
 pico_add_extra_outputs(MLPTestPicoSDK)
+
+# Build-framework gate for the RP2350 core-0/core-1 memory-placement guarantees:
+# fails the build if any mlp/ hot-path symbol, or the core-0/core-1 SRAM banks
+# themselves, land outside their selected 256 KiB window. See scripts/validate_memory_placement.py.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(TARGET MLPTestPicoSDK POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_memory_placement.py
+                $<TARGET_FILE:MLPTestPicoSDK>
+                --core "${MEML_MLP_RUNS_ON_CORE}"
+                --readelf ${CMAKE_READELF}
+                --nm ${CMAKE_NM}
+        COMMENT "Validating core-0/core-1 memory placement"
+        VERBATIM)

@@ -28,7 +28,23 @@ SECTIONS
         __core1_stack_top__ = .;
     } > CORE1_RAM
 
+    /* Explicit, checked home for MEML_DATA_ON_CORE(0) state, symmetric with the
+     * core-1 bank above. Without this, .core0.bank still lands correctly in the
+     * default 256 KiB RAM region via ld's orphan-section placement, but that
+     * placement is implicit and unverifiable from the ELF map; this makes it an
+     * explicit, ASSERT-guarded guarantee instead.
+     */
+    .core0_bank (NOLOAD) : ALIGN(8)
+    {
+        __core0_bank_start__ = .;
+        *(.core0.bank)
+        . = ALIGN(8);
+        __core0_bank_end__ = .;
+    } > RAM
+
     ASSERT((__core1_code_end__ <= __core1_bank_start__), "core1 copied code overlaps the mutable bank region")
     ASSERT((__core1_bank_end__ <= 0x20080000), "core1 bank overflowed 256 KiB SRAM window")
     ASSERT((__core1_stack_top__ <= 0x20080000), "core1 stack overflowed 256 KiB SRAM window")
+    ASSERT((__core0_bank_start__ >= 0x20000000), "core0 bank underflowed the default 256 KiB SRAM window")
+    ASSERT((__core0_bank_end__ <= 0x20040000), "core0 bank overflowed the default 256 KiB SRAM window")
 }

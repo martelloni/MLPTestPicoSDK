@@ -5,7 +5,14 @@
 #include "hardware/vreg.h"
 #include "tests/unit/UnitTestRunner.hpp"
 
-#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+// Excluded only for MEML_MLP_RUNS_ON_CORE == 1: this benchmark hardcodes its own
+// network onto core 0 via MEML_DATA_ON_CORE(0)/MEML_RUNS_ON_CORE(0), independent of
+// the project-wide selector. Once that selector is 1, the shared mlp/ hot-path code
+// hook (SMLP_CODE_ATTR) would route this core-0-only network's code into the core-1
+// bank while its state stays on core 0 -- exactly the split the selector exists to
+// prevent. Safe for the unpinned build (the hook expands to nothing there) and for
+// core-0 (hook and hardcoded placement agree).
+#if !defined(MEML_MLP_RUNS_ON_CORE) || MEML_MLP_RUNS_ON_CORE == 0
 #include "tests/TestRAMIndependence.hpp"
 #endif
 
@@ -33,7 +40,7 @@ int main()
         }
     }
 
-#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+#if !defined(MEML_MLP_RUNS_ON_CORE) || MEML_MLP_RUNS_ON_CORE == 0
     printf("Press any key to start benchmarks...\n");
     while (stdio_usb_connected() == false) {
         tight_loop_contents();

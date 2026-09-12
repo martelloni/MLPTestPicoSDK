@@ -20,6 +20,21 @@
 #define MEML_RUNS_ON_CORE(n) \
     __attribute__((section(".time_critical.core" MEML_STR(n) ".code"), used, noinline, optimize("O2")))
 
+/* Same section as MEML_RUNS_ON_CORE(n), deliberately without `used`. This is
+ * bound to mlp/'s hot-path member function templates (SMLP_CODE_ATTR), which
+ * are ordinary functions reached through normal calls -- a real call site is
+ * enough to keep them alive under --gc-sections. `used` on a class-template
+ * member function instead forces GCC to eagerly instantiate it (and every
+ * function it calls) the moment the enclosing template is instantiated, even
+ * if it is never actually called; every untagged callee an instantiated-but-
+ * unused method drags in then lands in the default bank instead of the
+ * selected one. MEML_RUNS_ON_CORE(n) keeps `used` for its own use sites
+ * (address-taken entry points registered as raw function pointers, where the
+ * compiler cannot otherwise see the reference).
+ */
+#define MEML_RUNS_ON_CORE_CODE(n) \
+    __attribute__((section(".time_critical.core" MEML_STR(n) ".code"), noinline, optimize("O2")))
+
 #define MEML_DATA_ON_CORE(n) \
     __attribute__((section(".core" MEML_STR(n) ".bank"), used, aligned(8)))
 
@@ -28,10 +43,10 @@
 
 #if defined(MEML_MLP_RUNS_ON_CORE)
 #if MEML_MLP_RUNS_ON_CORE == 0
-#define MEML_MLP_CODE MEML_RUNS_ON_CORE(0)
+#define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(0)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(0)
 #elif MEML_MLP_RUNS_ON_CORE == 1
-#define MEML_MLP_CODE MEML_RUNS_ON_CORE(1)
+#define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(1)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(1)
 #else
 #error "MEML_MLP_RUNS_ON_CORE must be 0 or 1 when defined."
