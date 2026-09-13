@@ -86,7 +86,7 @@ int main()
         test::TestBase::TestResultsPerCore mlp_timing;
         test::TestBase::TestResultsPerCore other_timing;
         uint32_t other_iteration_cap;
-        uint32_t other_iterations_consumed_until_done;
+        uint64_t other_iterations_consumed_until_done;
     };
 
     test::TestRAMIndependence flooding_test(clock_frequency_hz, kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/true);
@@ -127,8 +127,13 @@ int main()
     }
     printf("  MLP core: avg_time=%.2f us, max_time=%.2f us\n",
            flood.mlp_timing.time_us_avg, flood.mlp_timing.time_us_max);
-    printf("  other core: flood iterations consumed until done=%u (cap=%u)\n\n",
-           flood.other_iterations_consumed_until_done, flood.other_iteration_cap);
+    // Printed in exponential notation, not as a raw decimal: the flood loop
+    // is genuinely uncapped (see OtherCoreFloodTask), so the actual count
+    // depends on FillOnce()'s real hardware speed and can be large enough
+    // that %llu would be an unwieldy wall of digits even though it still fits
+    // in the uint64_t counter itself.
+    printf("  other core: flood iterations consumed until done=%.6e\n\n",
+           static_cast<double>(flood.other_iterations_consumed_until_done));
 
     printf("Dormant run (other core fully idle in WFE):\n");
     for (uint32_t i = 0; i < dormant.result_count; ++i) {

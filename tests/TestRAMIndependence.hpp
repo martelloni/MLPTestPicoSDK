@@ -95,13 +95,17 @@ public:
     }
     uint32_t GetTrainingResultCount() const { return result_count_; }
 
-    /// The other core's fixed per-run iteration cap: training_repeats * epochs_per_session *
-    /// kIterationSafetyMultiplier when flooding, exactly 1 when dormant.
+    /// The other core's outer iteration cap as configured on TestBase: always
+    /// exactly 1, since the flood/dormant task loops internally until
+    /// training_done_ rather than being called a preset number of times.
     uint32_t GetOtherCoreIterationCap() const { return other_core_iteration_cap_; }
 
-    /// Only meaningful when constructed with runOtherCoreTask=true: the flood
-    /// iteration count at which training_done_ was first observed true.
-    uint32_t GetOtherCoreIterationsConsumedUntilDone() const { return flood_iterations_at_done_; }
+    /// Only meaningful when constructed with runOtherCoreTask=true: how many
+    /// RAMFlooder::FillOnce() passes ran before training_done_ was observed
+    /// true. 64-bit: the flood loop is genuinely uncapped (see
+    /// OtherCoreFloodTask), so a long-enough run -- many training_repeats /
+    /// epochs_per_session, or a very fast FillOnce() -- could exceed UINT32_MAX.
+    uint64_t GetOtherCoreIterationsConsumedUntilDone() const { return flood_iterations_at_done_; }
 
 private:
 
@@ -109,18 +113,21 @@ private:
     static constexpr uint32_t kBaseSeed = 0xC0DEu;
     static constexpr float kLearningRate = 0.01f;
 
-    // The flooding core's iteration cap must vastly outlast the MLP core's total session
-    // time so training_done_ is essentially guaranteed observed well before the cap is
-    // reached; past that point every further iteration is just a cheap atomic load and
-    // return. 50x is a generous safety margin over one flood pass per MLP epoch.
-    static constexpr uint32_t kIterationSafetyMultiplier = 50u;
-
+    // The other core's outer iteration cap is always exactly 1: TestBase's
+    // Core1Entry loop bound is fixed at construction time, before training
+    // even starts, so any fixed guess at "how many flood passes outlast N
+    // training sessions" is a race that can lose (a flood pass over 96-240 KB
+    // is far cheaper than a real training epoch, so a guessed cap can run out
+    // and leave the other core idle for the rest of the MLP core's run,
+    // silently defeating the whole point of the benchmark). Instead, both
+    // OtherCoreFloodTask and OtherCoreDormantTask loop internally until
+    // training_done_ is observed, and are each called exactly once.
     static TestConfig BuildConfig(uint32_t clock_frequency_hz, uint32_t training_repeats,
                                    uint32_t epochs_per_session, bool runOtherCoreTask) {
+        (void)epochs_per_session;
+        (void)runOtherCoreTask;
         const uint32_t mlp_iterations = training_repeats;
-        const uint32_t other_iterations = runOtherCoreTask
-            ? training_repeats * epochs_per_session * kIterationSafetyMultiplier
-            : 1u;
+        const uint32_t other_iterations = 1u;
         other_core_iteration_cap_ = other_iterations;
 #if MEML_MLP_RUNS_ON_CORE == 0
         return TestConfig{clock_frequency_hz, mlp_iterations, other_iterations};
@@ -162,9 +169,8 @@ private:
     inline static std::array<MLPOpticalRecognition::Result, kMaxTrainingRepeats> training_results_{};
     inline static uint32_t result_count_{0u};
 
-    inline static uint32_t flood_iteration_counter_{0u};
-    inline static bool flood_done_recorded_{false};
-    inline static uint32_t flood_iterations_at_done_{0u};
+    inline static uint64_t flood_iteration_counter_{0u};
+    inline static uint64_t flood_iterations_at_done_{0u};
 
     static MEML_TEST_MLP_CORE_ATTR void MlpCoreInit() {
         // Reset per-run state so repeated RunTest() calls on the same instance
@@ -218,21 +224,19 @@ private:
 
     static MEML_TEST_OTHER_CORE_ATTR void OtherCoreFloodInit() {
         flood_iteration_counter_ = 0u;
-        flood_done_recorded_ = false;
         flood_iterations_at_done_ = 0u;
     }
 
     static MEML_TEST_OTHER_CORE_ATTR void OtherCoreFloodTask() {
-        ++flood_iteration_counter_;
-        // Check completion before flooding, negligible next to the flood traffic itself.
-        if (training_done_.load(std::memory_order_acquire)) {
-            if (!flood_done_recorded_) {
-                flood_done_recorded_ = true;
-                flood_iterations_at_done_ = flood_iteration_counter_;
-            }
-            return; // MLP core finished: remaining iterations are a cheap load-and-return.
+        // Called exactly once (other_core_iteration_cap_ == 1); loops
+        // internally, mirroring OtherCoreDormantTask below, so flooding
+        // spans the MLP core's whole variable-length training run instead of
+        // racing a fixed outer iteration count that could run out early.
+        while (!training_done_.load(std::memory_order_acquire)) {
+            ram_flooder_.FillOnce();
+            ++flood_iteration_counter_;
         }
-        ram_flooder_.FillOnce();
+        flood_iterations_at_done_ = flood_iteration_counter_;
     }
 
     static MEML_TEST_OTHER_CORE_ATTR void OtherCoreDormantInit() {
