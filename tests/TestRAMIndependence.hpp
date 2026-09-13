@@ -63,18 +63,16 @@ public:
     static constexpr uint32_t kMaxTrainingRepeats = 32u;
 
     /**
-     * @param clock_frequency_hz System clock, used for cycle-to-microsecond conversion.
      * @param training_repeats Independent train-from-scratch sessions run on the MLP core.
      * @param epochs_per_session Epochs passed to each session's Train() call.
      * @param runOtherCoreTask true pins the RAM-flooding task to the other core;
      * false pins a fully dormant (WFE-blocked, zero memory traffic) task instead.
      * This selects a function pointer once at construction time, not a runtime branch.
      */
-    TestRAMIndependence(uint32_t clock_frequency_hz,
-                         uint32_t training_repeats = 10u,
+    TestRAMIndependence(uint32_t training_repeats = 10u,
                          uint32_t epochs_per_session = 10u,
                          bool runOtherCoreTask = true)
-        : TestBase(BuildConfig(clock_frequency_hz, training_repeats, epochs_per_session, runOtherCoreTask)) {
+        : TestBase(BuildConfig(training_repeats, epochs_per_session, runOtherCoreTask)) {
         training_repeats_ = training_repeats;
         epochs_per_session_ = epochs_per_session;
         run_other_core_task_ = runOtherCoreTask;
@@ -107,6 +105,14 @@ public:
     /// epochs_per_session, or a very fast FillOnce() -- could exceed UINT32_MAX.
     uint64_t GetOtherCoreIterationsConsumedUntilDone() const { return flood_iterations_at_done_; }
 
+    /// Only meaningful when constructed with runOtherCoreTask=true: mean and
+    /// max wall-clock duration (microseconds) of a single RAMFlooder::FillOnce()
+    /// pass, timed individually per pass over the whole flood loop. Lets a
+    /// caller sanity-check the flood-iteration count above against how long
+    /// each pass actually took, rather than trusting the count alone.
+    float GetOtherCoreFillTimeUsMean() const { return time_us_mean_; }
+    float GetOtherCoreFillTimeUsMax() const { return time_us_max_; }
+
 private:
 
     // Deterministic per-session seed base, matching MLPOpticalRecognitionTest.cpp's convention.
@@ -122,7 +128,7 @@ private:
     // silently defeating the whole point of the benchmark). Instead, both
     // OtherCoreFloodTask and OtherCoreDormantTask loop internally until
     // training_done_ is observed, and are each called exactly once.
-    static TestConfig BuildConfig(uint32_t clock_frequency_hz, uint32_t training_repeats,
+    static TestConfig BuildConfig(uint32_t training_repeats,
                                    uint32_t epochs_per_session, bool runOtherCoreTask) {
         (void)epochs_per_session;
         (void)runOtherCoreTask;
@@ -130,9 +136,9 @@ private:
         const uint32_t other_iterations = 1u;
         other_core_iteration_cap_ = other_iterations;
 #if MEML_MLP_RUNS_ON_CORE == 0
-        return TestConfig{clock_frequency_hz, mlp_iterations, other_iterations};
+        return TestConfig{mlp_iterations, other_iterations};
 #else
-        return TestConfig{clock_frequency_hz, other_iterations, mlp_iterations};
+        return TestConfig{other_iterations, mlp_iterations};
 #endif
     }
 
@@ -172,6 +178,9 @@ private:
     inline static uint64_t flood_iteration_counter_{0u};
     inline static uint64_t flood_iterations_at_done_{0u};
 
+    inline static float time_us_mean_{0.0f};
+    inline static float time_us_max_{0.0f};
+
     static MEML_TEST_MLP_CORE_ATTR void MlpCoreInit() {
         // Reset per-run state so repeated RunTest() calls on the same instance
         // (e.g. the flooding-vs-dormant correctness-independence comparison) start clean.
@@ -206,7 +215,7 @@ private:
         ++session_index_;
 
         // Progress checkpoint over stdio, deliberately AFTER Stop*Measurement*()
-        // above so it never adds into the DWT-cycle-counted training time; a
+        // above so it never adds into the measured training time; a
         // multi-session run at 100 epochs/session can otherwise sit silent for a
         // long time. pico_stdio_usb serialises output with its own internal mutex
         // (stdio_usb_mutex in stdio_usb.c), so this is safe whichever physical
@@ -228,15 +237,30 @@ private:
     }
 
     static MEML_TEST_OTHER_CORE_ATTR void OtherCoreFloodTask() {
+        uint64_t time_us_accumulator = 0u;
+        uint64_t time_us_max = 0u;
         // Called exactly once (other_core_iteration_cap_ == 1); loops
         // internally, mirroring OtherCoreDormantTask below, so flooding
         // spans the MLP core's whole variable-length training run instead of
         // racing a fixed outer iteration count that could run out early.
         while (!training_done_.load(std::memory_order_acquire)) {
+            // Timed per-pass, not against a start captured once before the
+            // loop: a single pre-loop timestamp would make every time_us_diff
+            // an elapsed-since-loop-start value (monotonically increasing),
+            // making the "mean" meaningless and the "max" just the final
+            // total elapsed time instead of the slowest single FillOnce().
+            const uint64_t time_us_start = time_us_64();
             ram_flooder_.FillOnce();
+            const uint64_t time_us_diff = time_us_64() - time_us_start;
             ++flood_iteration_counter_;
+            time_us_accumulator += time_us_diff;
+            if (time_us_diff > time_us_max) {
+                time_us_max = time_us_diff;
+            }
         }
         flood_iterations_at_done_ = flood_iteration_counter_;
+        time_us_mean_ = static_cast<float>(time_us_accumulator) / static_cast<float>(flood_iterations_at_done_);
+        time_us_max_ = static_cast<float>(time_us_max);
     }
 
     static MEML_TEST_OTHER_CORE_ATTR void OtherCoreDormantInit() {

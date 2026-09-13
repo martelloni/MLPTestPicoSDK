@@ -14,6 +14,11 @@ Checks the four guarantees Step 1 of plan-mlpCoreLocalPrompt.md establishes:
      would have caught a hot-path function silently missing its placement
      hook, or a project TU including mlp/*.h before binding MemoryDefs.hpp.
 
+For the unpinned configuration (--core ""), Step 7 removes the per-bank
+placement scheme entirely, so none of the above applies; the only check is
+that the scheme's sections are genuinely absent from the ELF (see
+check_scheme_absent), proving the linker override was actually skipped.
+
 Usage:
     validate_memory_placement.py <elf> --core "" --readelf <path> --nm <path>
 """
@@ -212,6 +217,20 @@ def check_benchmark_placement(symbols, core, errors):
             )
 
 
+_ABSENT_FOR_UNPINNED = (".core0_bank", ".core1_bank", ".core1_stack", ".time_critical.core1.code")
+
+
+def check_scheme_absent(sections, errors):
+    """Unpinned build only (Step 7): the custom linker fragments are skipped
+    entirely, so none of the per-bank sections should exist in the ELF at
+    all. Their presence would mean the override path was not actually
+    skipped, not merely that nothing happened to land in them.
+    """
+    for name in _ABSENT_FOR_UNPINNED:
+        if name in sections:
+            fail(errors, f"unpinned build must not have section '{name}' -- linker override was not skipped")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("elf", help="Path to the built ELF")
@@ -229,15 +248,21 @@ def main():
     symbols = parse_symbols(run(args.nm, [args.elf]))
 
     errors = []
-    check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
-    for name in CORE1_SECTIONS:
-        check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
-    check_flash_outside_ram(sections, errors)
-    check_mlp_symbol_placement(symbols, args.core, errors)
-    if args.mode == "tests":
-        check_placement_probe(symbols, args.core, errors)
+    if args.core == "":
+        # No per-bank placement scheme exists in this configuration (Step 7):
+        # there is nothing left to check except that the scheme was genuinely
+        # skipped, not just that nothing happened to land in it.
+        check_scheme_absent(sections, errors)
     else:
-        check_benchmark_placement(symbols, args.core, errors)
+        check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
+        for name in CORE1_SECTIONS:
+            check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
+        check_flash_outside_ram(sections, errors)
+        check_mlp_symbol_placement(symbols, args.core, errors)
+        if args.mode == "tests":
+            check_placement_probe(symbols, args.core, errors)
+        else:
+            check_benchmark_placement(symbols, args.core, errors)
 
     if errors:
         print(f"validate_memory_placement: FAIL ({len(errors)} issue(s)) "

@@ -24,9 +24,20 @@
 #endif
 
 // Set by CMake's RUN_TESTS_OR_BENCHMARKS="benchmarks": skips unit tests and
-// builds the benchmark suite (currently TestRAMIndependence only) instead.
+// builds the benchmark suite instead. Step 7: the pinned configurations
+// (MEML_MLP_RUNS_ON_CORE=0/1) run TestRAMIndependence against Step 1's real
+// per-core placement scheme; the unpinned configuration runs
+// TestNaiveMemoryLayout, the honest counterfactual with no placement scheme
+// at all. Both share the same public surface, so the rest of this file uses
+// them through one alias rather than duplicating the comparison logic.
 #if defined(MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
+#if defined(MEML_MLP_RUNS_ON_CORE)
 #include "tests/TestRAMIndependence.hpp"
+using BenchmarkTest = test::TestRAMIndependence;
+#else
+#include "tests/TestNaiveMemoryLayout.hpp"
+using BenchmarkTest = test::TestNaiveMemoryLayout;
+#endif
 #endif
 
 int main()
@@ -81,20 +92,26 @@ int main()
     // read. Snapshot each run's data into locals immediately after RunTest()
     // returns, before constructing the next run.
     struct RunSnapshot {
-        std::array<MLPOpticalRecognition::Result, test::TestRAMIndependence::kMaxTrainingRepeats> results;
+        std::array<MLPOpticalRecognition::Result, BenchmarkTest::kMaxTrainingRepeats> results;
         uint32_t result_count;
         test::TestBase::TestResultsPerCore mlp_timing;
         test::TestBase::TestResultsPerCore other_timing;
         uint32_t other_iteration_cap;
         uint64_t other_iterations_consumed_until_done;
+        float other_fill_time_us_mean;
+        float other_fill_time_us_max;
     };
 
-    test::TestRAMIndependence flooding_test(clock_frequency_hz, kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/true);
+    BenchmarkTest flooding_test(kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/true);
     flooding_test.RunTest();
     RunSnapshot flood{};
     flood.results = flooding_test.GetTrainingResults();
     flood.result_count = flooding_test.GetTrainingResultCount();
-#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+// The MLP experiment runs on TestBase's core-0 slot for both the unpinned
+// build (TestNaiveMemoryLayout's fixed assignment, since there is no
+// selector to key off) and the MEML_MLP_RUNS_ON_CORE=0 pinned build; only
+// the =1 pinned build puts it on core 1.
+#if !defined(MEML_MLP_RUNS_ON_CORE) || MEML_MLP_RUNS_ON_CORE == 0
     flood.mlp_timing = flooding_test.GetResults().core0;
     flood.other_timing = flooding_test.GetResults().core1;
 #else
@@ -103,13 +120,15 @@ int main()
 #endif
     flood.other_iteration_cap = flooding_test.GetOtherCoreIterationCap();
     flood.other_iterations_consumed_until_done = flooding_test.GetOtherCoreIterationsConsumedUntilDone();
+    flood.other_fill_time_us_mean = flooding_test.GetOtherCoreFillTimeUsMean();
+    flood.other_fill_time_us_max = flooding_test.GetOtherCoreFillTimeUsMax();
 
-    test::TestRAMIndependence dormant_test(clock_frequency_hz, kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/false);
+    BenchmarkTest dormant_test(kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/false);
     dormant_test.RunTest();
     RunSnapshot dormant{};
     dormant.results = dormant_test.GetTrainingResults();
     dormant.result_count = dormant_test.GetTrainingResultCount();
-#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+#if !defined(MEML_MLP_RUNS_ON_CORE) || MEML_MLP_RUNS_ON_CORE == 0
     dormant.mlp_timing = dormant_test.GetResults().core0;
     dormant.other_timing = dormant_test.GetResults().core1;
 #else
@@ -132,8 +151,11 @@ int main()
     // depends on FillOnce()'s real hardware speed and can be large enough
     // that %llu would be an unwieldy wall of digits even though it still fits
     // in the uint64_t counter itself.
-    printf("  other core: flood iterations consumed until done=%.6e\n\n",
+    printf("  other core: flood iterations consumed until done=%.6e\n",
            static_cast<double>(flood.other_iterations_consumed_until_done));
+    printf("  other core: fill_time avg=%.2f us, max=%.2f us\n\n",
+           static_cast<double>(flood.other_fill_time_us_mean),
+           static_cast<double>(flood.other_fill_time_us_max));
 
     printf("Dormant run (other core fully idle in WFE):\n");
     for (uint32_t i = 0; i < dormant.result_count; ++i) {
@@ -167,9 +189,20 @@ int main()
     const bool timing_independent = avg_diff_ratio <= kTimingToleranceRatio && max_diff_ratio <= kTimingToleranceRatio;
 
     printf("Correctness independence (bit-identical loss/accuracy): %s\n", results_identical ? "PASS" : "FAIL");
+#if defined(MEML_MLP_RUNS_ON_CORE)
     printf("Timing independence (avg_diff=%.2f%%, max_diff=%.2f%%, tolerance=%.0f%%): %s\n",
            static_cast<double>(avg_diff_ratio * 100.0f), static_cast<double>(max_diff_ratio * 100.0f),
            static_cast<double>(kTimingToleranceRatio * 100.0f), timing_independent ? "PASS" : "FAIL");
+#else
+    // Unpinned/naive layout: a timing deviation beyond kTimingToleranceRatio
+    // here is the EXPECTED, DESIRED outcome (this build has no per-core
+    // placement scheme at all), so this is reported as a finding, not gated
+    // as PASS/FAIL the way the pinned builds' comparison is.
+    (void)timing_independent;
+    printf("Timing interference observed without per-core placement (expected): avg_diff=%.2f%%, max_diff=%.2f%%, tolerance=%.0f%%\n",
+           static_cast<double>(avg_diff_ratio * 100.0f), static_cast<double>(max_diff_ratio * 100.0f),
+           static_cast<double>(kTimingToleranceRatio * 100.0f));
+#endif
 
     printf("\nTest completed.\n");
 #endif

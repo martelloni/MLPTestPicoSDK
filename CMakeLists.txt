@@ -30,6 +30,11 @@ include(pico_sdk_import.cmake)
 
 project(MLPTestPicoSDK C CXX ASM)
 
+# Needed early: the unpinned+benchmarks configuration below runs a Python
+# helper script (scripts/compute_naive_flooder_size.py) as a build step for a
+# probe executable, ahead of the main target's own POST_BUILD validation step.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 set(MEML_MLP_RUNS_ON_CORE "" CACHE STRING "Compile-time MLP placement selector: blank, 0, or 1")
 
 # RAM is scarce on this target (a single 256 KiB copy_to_ram window shared by
@@ -50,8 +55,16 @@ pico_sdk_init()
 # Add executable. Default name is the project name, version 0.1
 
 set(MLPTestPicoSDK_SOURCES
-        main.cpp
-        memory/CoreSectionInit.cpp)
+        main.cpp)
+
+# memory/CoreSectionInit.cpp's meml_core1_preinit() only exists to copy/zero
+# the custom per-core SRAM sections the linker fragments below define; with
+# those fragments skipped for the unpinned build (Step 7), there is nothing
+# left for it to copy or zero, and the linker symbols it references would not
+# exist at all.
+if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
+    list(APPEND MLPTestPicoSDK_SOURCES memory/CoreSectionInit.cpp)
+endif()
 
 if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
     list(APPEND MLPTestPicoSDK_SOURCES
@@ -65,9 +78,12 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
 else()
-    # TestRAMIndependence now links against the real MLPOpticalRecognition
-    # facade rather than its own hardcoded network, so the benchmark build
-    # needs the same dataset/experiment translation units the tests build does.
+    # TestRAMIndependence (pinned builds) and TestNaiveMemoryLayout (unpinned
+    # build) both link against the real MLPOpticalRecognition facade rather
+    # than a hardcoded network, so the benchmark build needs the same
+    # dataset/experiment translation units the tests build does. Both
+    # benchmark headers are header-only and included directly by main.cpp, so
+    # no separate source file is added for either.
     list(APPEND MLPTestPicoSDK_SOURCES
         dataset/Dataset.cpp
         experiments/MLPOpticalRecognition.cpp)
@@ -90,15 +106,29 @@ endif()
 
 # Keep the SDK-generated linker script and inject only the custom per-core SRAM sections.
 # This is the supported Pico SDK extension point for custom linker fragments.
-pico_add_linker_script_override_path(MLPTestPicoSDK
-        ${CMAKE_CURRENT_SOURCE_DIR}/linker
-        FILES memory_extra.incl section_extra_post_text.incl section_extra_post_data.incl)
+# Step 7: the unpinned (MEML_MLP_RUNS_ON_CORE blank) configuration must be a
+# genuine naive-layout counterfactual, not the pinned layout with just the
+# experiment's own tagging switched off, so it gets none of these custom
+# fragments -- no CORE1_RAM region, no explicit .core0_bank/.core1_bank/
+# .core1_stack/.time_critical.core1.code sections, none of their ASSERTs.
+if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
+    pico_add_linker_script_override_path(MLPTestPicoSDK
+            ${CMAKE_CURRENT_SOURCE_DIR}/linker
+            FILES memory_extra.incl section_extra_post_text.incl section_extra_post_data.incl)
+endif()
 
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
 
 # Reserve the default/core-0 SRAM region as 256 KiB so the remaining 256 KiB bank
-# remains dedicated to the selected core-1 layout.
+# remains dedicated to the selected core-1 layout. Deliberately unconditional,
+# including for the unpinned build: leaving that build at the SDK's ~512 KiB
+# default would let the linker spread the naive benchmark's static objects far
+# enough apart that they might land in different physical SRAM banks by
+# chance, silently reproducing a pinned-like layout and defeating Step 7's
+# naive-layout counterfactual. Confining it to the same 256 KiB window forces
+# every static object -- MLP experiment, flood buffer, ordinary .data/.bss,
+# stacks -- through the SDK's own default allocator into one physical region.
 pico_set_linker_script_var(MLPTestPicoSDK RAM_LENGTH 256k)
 
 # Keep the image flash-loadable as a standard UF2: the binary is stored in flash and then
@@ -121,10 +151,53 @@ target_include_directories(MLPTestPicoSDK PRIVATE
 
 pico_add_extra_outputs(MLPTestPicoSDK)
 
+# Step 7: size the unpinned benchmark's RAM flooder to whatever the shared
+# 256 KiB window has left after every other static object in the program,
+# rather than a fixed guess -- otherwise leftover slack could let the
+# compiler/linker keep mlp_experiment_ and ram_flooder_ comfortably apart,
+# under-representing naive-layout contention. This needs a two-pass build: a
+# throwaway probe with a nominal 1-word flooder measures "everything else",
+# then a script computes the real flooder size from the probe's own ELF.
+if(MEML_MLP_RUNS_ON_CORE STREQUAL "" AND RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks")
+    add_executable(MLPTestPicoSDK_naive_flooder_probe
+            main.cpp
+            dataset/Dataset.cpp
+            experiments/MLPOpticalRecognition.cpp)
+    target_compile_definitions(MLPTestPicoSDK_naive_flooder_probe PRIVATE
+            MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK
+            MEML_NAIVE_FLOODER_PROBE_BUILD)
+    target_include_directories(MLPTestPicoSDK_naive_flooder_probe PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR})
+    target_link_libraries(MLPTestPicoSDK_naive_flooder_probe
+            pico_stdlib
+            pico_multicore)
+    pico_set_binary_type(MLPTestPicoSDK_naive_flooder_probe copy_to_ram)
+    pico_set_linker_script_var(MLPTestPicoSDK_naive_flooder_probe RAM_LENGTH 256k)
+    # Match the real target's stdio configuration so main.cpp (shared between
+    # both) compiles identically; the probe is never actually flashed or run.
+    pico_enable_stdio_uart(MLPTestPicoSDK_naive_flooder_probe 0)
+    pico_enable_stdio_usb(MLPTestPicoSDK_naive_flooder_probe 1)
+    pico_add_extra_outputs(MLPTestPicoSDK_naive_flooder_probe)
+
+    set(MEML_NAIVE_FLOODER_SIZE_HEADER ${CMAKE_BINARY_DIR}/generated/NaiveFlooderSize.hpp)
+    add_custom_command(
+            OUTPUT ${MEML_NAIVE_FLOODER_SIZE_HEADER}
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/compute_naive_flooder_size.py
+                    $<TARGET_FILE:MLPTestPicoSDK_naive_flooder_probe>
+                    --readelf ${CMAKE_READELF}
+                    --output ${MEML_NAIVE_FLOODER_SIZE_HEADER}
+            DEPENDS MLPTestPicoSDK_naive_flooder_probe
+            COMMENT "Computing naive-layout RAM flooder size from probe build"
+            VERBATIM)
+    add_custom_target(MLPTestPicoSDK_naive_flooder_size DEPENDS ${MEML_NAIVE_FLOODER_SIZE_HEADER})
+    add_dependencies(MLPTestPicoSDK MLPTestPicoSDK_naive_flooder_size)
+    target_include_directories(MLPTestPicoSDK PRIVATE ${CMAKE_BINARY_DIR}/generated)
+endif()
+
 # Build-framework gate for the RP2350 core-0/core-1 memory-placement guarantees:
 # fails the build if any mlp/ hot-path symbol, or the core-0/core-1 SRAM banks
 # themselves, land outside their selected 256 KiB window. See scripts/validate_memory_placement.py.
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_command(TARGET MLPTestPicoSDK POST_BUILD
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/validate_memory_placement.py
