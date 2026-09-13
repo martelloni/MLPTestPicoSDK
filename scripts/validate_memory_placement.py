@@ -171,6 +171,47 @@ def check_placement_probe(symbols, core, errors):
             )
 
 
+def check_benchmark_placement(symbols, core, errors):
+    """"benchmarks" mode only: TestRAMIndependence.hpp's build-owned
+    mlp_experiment_ instance must land in the selected core's bank (like
+    check_placement_probe's g_experiment for "tests" mode), and its
+    ram_flooder_ instance must land in the OTHER core's bank -- the flooder
+    and the MLP experiment are always on opposite cores, driven by the same
+    MEML_MLP_RUNS_ON_CORE selector, per Step 6 of plan-mlpCoreLocalPrompt.md.
+    """
+    mlp_lo, mlp_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
+    other_lo, other_hi = (RAM0_BASE, RAM0_END) if core == "1" else (RAM1_BASE, RAM1_END)
+
+    # Exclude compiler-generated dynamic-initialization guard variables
+    # (Itanium ABI "_ZGV" prefix): GCC never applies a data symbol's own
+    # section attribute to its guard flag, so the guard lands wherever the
+    # linker's default rules put ordinary .bss -- it is bookkeeping, not
+    # the actual placed object, and checking it would be a false positive.
+    mlp_symbols = [(addr, name) for addr, name in symbols if "mlp_experiment_" in name and "_ZGV" not in name]
+    flooder_symbols = [(addr, name) for addr, name in symbols if "ram_flooder_" in name and "_ZGV" not in name]
+
+    if not mlp_symbols:
+        fail(errors, "TestRAMIndependence's mlp_experiment_ symbol not found in the ELF -- was it linked in?")
+    for addr, name in mlp_symbols:
+        if not (mlp_lo <= addr < mlp_hi):
+            fail(
+                errors,
+                f"benchmark placement-probe symbol '{name}' at {addr:#x} is outside the "
+                f"selected core's bank [{mlp_lo:#x}, {mlp_hi:#x})",
+            )
+
+    if not flooder_symbols:
+        fail(errors, "TestRAMIndependence's ram_flooder_ symbol not found in the ELF -- was it linked in?")
+    for addr, name in flooder_symbols:
+        if not (other_lo <= addr < other_hi):
+            fail(
+                errors,
+                f"benchmark RAM flooder symbol '{name}' at {addr:#x} is outside the "
+                f"OTHER core's bank [{other_lo:#x}, {other_hi:#x}) -- it must stay opposite "
+                "the selected MEML_MLP_RUNS_ON_CORE bank",
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("elf", help="Path to the built ELF")
@@ -195,6 +236,8 @@ def main():
     check_mlp_symbol_placement(symbols, args.core, errors)
     if args.mode == "tests":
         check_placement_probe(symbols, args.core, errors)
+    else:
+        check_benchmark_placement(symbols, args.core, errors)
 
     if errors:
         print(f"validate_memory_placement: FAIL ({len(errors)} issue(s)) "

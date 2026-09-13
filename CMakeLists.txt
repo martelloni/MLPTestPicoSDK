@@ -64,6 +64,13 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/LossTest.cpp
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
+else()
+    # TestRAMIndependence now links against the real MLPOpticalRecognition
+    # facade rather than its own hardcoded network, so the benchmark build
+    # needs the same dataset/experiment translation units the tests build does.
+    list(APPEND MLPTestPicoSDK_SOURCES
+        dataset/Dataset.cpp
+        experiments/MLPOpticalRecognition.cpp)
 endif()
 
 add_executable(MLPTestPicoSDK ${MLPTestPicoSDK_SOURCES})

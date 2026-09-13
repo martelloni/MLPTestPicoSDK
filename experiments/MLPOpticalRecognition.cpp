@@ -14,8 +14,13 @@
 
 void MLPOpticalRecognition::Initialise(uint32_t seed) {
     // Same seed -> same initial weights -> same subsequent training trajectory.
+    // Also clear RMSProp's per-weight squared-gradient EMA: InitXavier() only
+    // re-randomizes weights, so without this a session's first gradient step
+    // would still be shaped by whatever training happened on this instance
+    // before Initialise() was called, breaking reproducibility across runs.
     state_.net.SetSeed(seed);
     state_.net.InitXavier();
+    state_.net.ResetOptimizerState();
 }
 
 MLPOpticalRecognition::Result MLPOpticalRecognition::Train(uint32_t epochs, float learning_rate) {

@@ -112,6 +112,11 @@ public:
         const uint32_t completion = multicore_fifo_pop_blocking();
         (void)completion;
 
+        // Reset core 1 so a later RunTest() call on the same or another
+        // instance can safely relaunch it (the SDK does not allow relaunching
+        // a still-halted core 1 without this).
+        multicore_reset_core1();
+
         results_.core0 = scratch_core0_;
         results_.core1 = scratch_core1_;
     }

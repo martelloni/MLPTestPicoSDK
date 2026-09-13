@@ -69,21 +69,31 @@
 #if defined(MEML_MLP_RUNS_ON_CORE)
 #if MEML_MLP_RUNS_ON_CORE == 0
 #define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(0)
+#define MEML_MLP_CODE_MULTI MEML_RUNS_ON_CORE(0)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(0)
 #elif MEML_MLP_RUNS_ON_CORE == 1
 #define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(1)
+#define MEML_MLP_CODE_MULTI MEML_RUNS_ON_CORE(1)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(1)
 #else
 #error "MEML_MLP_RUNS_ON_CORE must be 0 or 1 when defined."
 #endif
 #else
 #define MEML_MLP_CODE
+#define MEML_MLP_CODE_MULTI
 #define MEML_MLP_DATA
 #endif
 
 #undef SMLP_CODE_ATTR
+#undef SMLP_CODE_ATTR_MULTI
 #undef SMLP_DATA_ATTR
 #define SMLP_CODE_ATTR MEML_MLP_CODE
+// Reuses MEML_RUNS_ON_CORE(n) (which carries `used`) rather than
+// MEML_RUNS_ON_CORE_CODE(n): see mlp/Placement.h's SMLP_CODE_ATTR_MULTI
+// comment for why multiply-instantiated hot-path templates need `used` to
+// avoid a GCC -O2/-O3 "section type conflict" that MEML_RUNS_ON_CORE_CODE's
+// __COUNTER__-shared section name otherwise triggers across instantiations.
+#define SMLP_CODE_ATTR_MULTI MEML_MLP_CODE_MULTI
 #define SMLP_DATA_ATTR MEML_MLP_DATA
 
 #endif // __MEMORY_DEFS_HPP__

@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <cmath>
+#include <algorithm>
+#include <array>
 #include "MemoryDefs.hpp"
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -30,7 +33,7 @@ int main()
 {
     stdio_init_all();
 
-    static constexpr uint32_t clock_frequency_hz = 125000000u; // 125 MHz
+    static constexpr uint32_t clock_frequency_hz = 150000000u; // 125 MHz
     set_sys_clock_khz(clock_frequency_hz / 1000, true);
 
     while (stdio_usb_connected() == false) {
@@ -61,23 +64,107 @@ int main()
         tight_loop_contents();
     }
     printf("\nStarting RAM independence test...\n");
-
-    test::TestRAMIndependence test(clock_frequency_hz);
-
     printf("Running RAM independence test with clock frequency: %u MHz\n\n", clock_frequency_hz / 1000000u);
 
-    test.RunTest();
+    // Run the real training workload twice with identical parameters, once
+    // against a RAM-flooding other core and once against a fully dormant
+    // (WFE-blocked) one, to verify the two cores' RAM banks are genuinely
+    // independent: the MLP core's computed results must not change at all,
+    // and its timing must not change by more than an agreed tolerance.
+    constexpr uint32_t kTrainingRepeats = 10u;
+    constexpr uint32_t kEpochsPerSession = 10u;
+    constexpr float kTimingToleranceRatio = 0.01f;
 
-    printf("Core 0: iterations=%u, avg_time=%.2f us, max_time=%.2f us, min_time=%.2f us\n",
-           test.GetResults().core0.iterations,
-           test.GetResults().core0.time_us_avg,
-           test.GetResults().core0.time_us_max,
-           test.GetResults().core0.time_us_min);
-    printf("Core 1: iterations=%u, avg_time=%.2f us, max_time=%.2f us, min_time=%.2f us\n",
-           test.GetResults().core1.iterations,
-           test.GetResults().core1.time_us_avg,
-           test.GetResults().core1.time_us_max,
-           test.GetResults().core1.time_us_min);
+    // TestRAMIndependence's training results/iteration-cap accounting are
+    // static (mirroring TestBase's own static CoreCallback-driven state), so
+    // a second construction/RunTest() overwrites the first's before it is
+    // read. Snapshot each run's data into locals immediately after RunTest()
+    // returns, before constructing the next run.
+    struct RunSnapshot {
+        std::array<MLPOpticalRecognition::Result, test::TestRAMIndependence::kMaxTrainingRepeats> results;
+        uint32_t result_count;
+        test::TestBase::TestResultsPerCore mlp_timing;
+        test::TestBase::TestResultsPerCore other_timing;
+        uint32_t other_iteration_cap;
+        uint32_t other_iterations_consumed_until_done;
+    };
+
+    test::TestRAMIndependence flooding_test(clock_frequency_hz, kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/true);
+    flooding_test.RunTest();
+    RunSnapshot flood{};
+    flood.results = flooding_test.GetTrainingResults();
+    flood.result_count = flooding_test.GetTrainingResultCount();
+#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+    flood.mlp_timing = flooding_test.GetResults().core0;
+    flood.other_timing = flooding_test.GetResults().core1;
+#else
+    flood.mlp_timing = flooding_test.GetResults().core1;
+    flood.other_timing = flooding_test.GetResults().core0;
+#endif
+    flood.other_iteration_cap = flooding_test.GetOtherCoreIterationCap();
+    flood.other_iterations_consumed_until_done = flooding_test.GetOtherCoreIterationsConsumedUntilDone();
+
+    test::TestRAMIndependence dormant_test(clock_frequency_hz, kTrainingRepeats, kEpochsPerSession, /*runOtherCoreTask=*/false);
+    dormant_test.RunTest();
+    RunSnapshot dormant{};
+    dormant.results = dormant_test.GetTrainingResults();
+    dormant.result_count = dormant_test.GetTrainingResultCount();
+#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 0
+    dormant.mlp_timing = dormant_test.GetResults().core0;
+    dormant.other_timing = dormant_test.GetResults().core1;
+#else
+    dormant.mlp_timing = dormant_test.GetResults().core1;
+    dormant.other_timing = dormant_test.GetResults().core0;
+#endif
+    dormant.other_iteration_cap = dormant_test.GetOtherCoreIterationCap();
+    dormant.other_iterations_consumed_until_done = dormant_test.GetOtherCoreIterationsConsumedUntilDone();
+
+    printf("Flooding run (other core flooding RAM):\n");
+    for (uint32_t i = 0; i < flood.result_count; ++i) {
+        printf("  session %u: loss=%f accuracy=%f\n", i,
+               static_cast<double>(flood.results[i].loss),
+               static_cast<double>(flood.results[i].accuracy));
+    }
+    printf("  MLP core: avg_time=%.2f us, max_time=%.2f us\n",
+           flood.mlp_timing.time_us_avg, flood.mlp_timing.time_us_max);
+    printf("  other core: flood iterations consumed until done=%u (cap=%u)\n\n",
+           flood.other_iterations_consumed_until_done, flood.other_iteration_cap);
+
+    printf("Dormant run (other core fully idle in WFE):\n");
+    for (uint32_t i = 0; i < dormant.result_count; ++i) {
+        printf("  session %u: loss=%f accuracy=%f\n", i,
+               static_cast<double>(dormant.results[i].loss),
+               static_cast<double>(dormant.results[i].accuracy));
+    }
+    printf("  MLP core: avg_time=%.2f us, max_time=%.2f us\n",
+           dormant.mlp_timing.time_us_avg, dormant.mlp_timing.time_us_max);
+    printf("  other core: iterations=%u (cap=%u, expected 1)\n\n",
+           dormant.other_timing.iterations, dormant.other_iteration_cap);
+
+    // Correctness independence: RAM-bank independence means core-1 memory
+    // traffic must not perturb core-0's (or vice versa) computed results at
+    // all -- bit-identical, not just approximately equal.
+    bool results_identical = flood.result_count == dormant.result_count;
+    for (uint32_t i = 0; results_identical && i < flood.result_count; ++i) {
+        const auto & a = flood.results[i];
+        const auto & b = dormant.results[i];
+        if (a.loss != b.loss || a.accuracy != b.accuracy) {
+            results_identical = false;
+        }
+    }
+
+    // Timing independence: the MLP core's average/max timing must not differ
+    // by more than the agreed tolerance between the two other-core conditions.
+    const float avg_diff_ratio = std::fabs(flood.mlp_timing.time_us_avg - dormant.mlp_timing.time_us_avg) /
+        std::max(dormant.mlp_timing.time_us_avg, 1.0f);
+    const float max_diff_ratio = std::fabs(flood.mlp_timing.time_us_max - dormant.mlp_timing.time_us_max) /
+        std::max(dormant.mlp_timing.time_us_max, 1.0f);
+    const bool timing_independent = avg_diff_ratio <= kTimingToleranceRatio && max_diff_ratio <= kTimingToleranceRatio;
+
+    printf("Correctness independence (bit-identical loss/accuracy): %s\n", results_identical ? "PASS" : "FAIL");
+    printf("Timing independence (avg_diff=%.2f%%, max_diff=%.2f%%, tolerance=%.0f%%): %s\n",
+           static_cast<double>(avg_diff_ratio * 100.0f), static_cast<double>(max_diff_ratio * 100.0f),
+           static_cast<double>(kTimingToleranceRatio * 100.0f), timing_independent ? "PASS" : "FAIL");
 
     printf("\nTest completed.\n");
 #endif
