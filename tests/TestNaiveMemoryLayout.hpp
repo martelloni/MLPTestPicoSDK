@@ -105,6 +105,14 @@ public:
     /// true.
     uint64_t GetOtherCoreIterationsConsumedUntilDone() const { return flood_iterations_at_done_; }
 
+    /// Only meaningful when constructed with runOtherCoreTask=true: mean and
+    /// max wall-clock duration (microseconds) of a single RAMFlooder::FillOnce()
+    /// pass, timed individually per pass over the whole flood loop. Lets a
+    /// caller sanity-check the flood-iteration count above against how long
+    /// each pass actually took, rather than trusting the count alone.
+    float GetOtherCoreFillTimeUsMean() const { return time_us_mean_; }
+    float GetOtherCoreFillTimeUsMax() const { return time_us_max_; }
+
 private:
 
     // Deterministic per-session seed base, matching TestRAMIndependence's convention.
@@ -153,6 +161,9 @@ private:
     inline static uint64_t flood_iteration_counter_{0u};
     inline static uint64_t flood_iterations_at_done_{0u};
 
+    inline static float time_us_mean_{0.0f};
+    inline static float time_us_max_{0.0f};
+
     static void MlpCoreInit() {
         // Reset per-run state so repeated RunTest() calls on the same instance
         // (e.g. the flooding-vs-dormant correctness-independence comparison) start clean.
@@ -197,15 +208,30 @@ private:
     }
 
     static void OtherCoreFloodTask() {
+        uint64_t time_us_accumulator = 0u;
+        uint64_t time_us_max = 0u;
         // Called exactly once (other_core_iteration_cap_ == 1); loops
         // internally, mirroring OtherCoreDormantTask below, so flooding
         // spans the MLP core's whole variable-length training run instead of
         // racing a fixed outer iteration count that could run out early.
         while (!training_done_.load(std::memory_order_acquire)) {
+            // Timed per-pass, not against a start captured once before the
+            // loop: a single pre-loop timestamp would make every time_us_diff
+            // an elapsed-since-loop-start value (monotonically increasing),
+            // making the "mean" meaningless and the "max" just the final
+            // total elapsed time instead of the slowest single FillOnce().
+            const uint64_t time_us_start = time_us_64();
             ram_flooder_.FillOnce();
+            const uint64_t time_us_diff = time_us_64() - time_us_start;
             ++flood_iteration_counter_;
+            time_us_accumulator += time_us_diff;
+            if (time_us_diff > time_us_max) {
+                time_us_max = time_us_diff;
+            }
         }
         flood_iterations_at_done_ = flood_iteration_counter_;
+        time_us_mean_ = static_cast<float>(time_us_accumulator) / static_cast<float>(flood_iterations_at_done_);
+        time_us_max_ = static_cast<float>(time_us_max);
     }
 
     static void OtherCoreDormantInit() {
