@@ -1,3 +1,6 @@
 build*/
 !.vscode/*
 .DS_Store
+.venv/
+benchmark_results/
+__pycache__/

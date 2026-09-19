@@ -43,7 +43,7 @@
  * prefix is preserved so the existing wildcard section rules keep matching.
  */
 #define MEML_RUNS_ON_CORE(n) \
-    __attribute__((section(".time_critical.core" MEML_STR(n) ".code." MEML_STR(__COUNTER__)), used, noinline, optimize("O2")))
+    __attribute__((section(".time_critical.core" MEML_STR(n) ".code." MEML_STR(__COUNTER__)), used))
 
 /* Same section prefix as MEML_RUNS_ON_CORE(n), deliberately without `used`. This
  * is bound to mlp/'s hot-path member function templates (SMLP_CODE_ATTR), which
@@ -56,9 +56,24 @@
  * selected one. MEML_RUNS_ON_CORE(n) keeps `used` for its own use sites
  * (address-taken entry points registered as raw function pointers, where the
  * compiler cannot otherwise see the reference).
+ *
+ * Neither macro forces `noinline`/`optimize("O2")` any more. Placement now
+ * follows the outermost tagged caller: a tagged callee inlined into a tagged
+ * caller stays in that caller's bank via the section attribute already
+ * carried through inlining, so the section still ends up right without
+ * paying for an out-of-line call on every hot-path step. Forcing `noinline`
+ * previously turned every per-weight helper (nn::fmul, activate, ...) into a
+ * real function call inside the innermost training loop, which measured as
+ * a ~1.7x slowdown against the unpinned build -- the call overhead, not
+ * memory-bank placement, was responsible. The trade-off: an *untagged*
+ * caller of mlp code now silently pulls that code into its own (wrong) bank
+ * with no out-of-line symbol left for the validator to catch, so every
+ * function that enters the MLP from outside must stay tagged with
+ * MEML_MLP_CODE (see check_mlp_symbol_placement's entry-point requirement in
+ * scripts/validate_memory_placement.py).
  */
 #define MEML_RUNS_ON_CORE_CODE(n) \
-    __attribute__((section(".time_critical.core" MEML_STR(n) ".code." MEML_STR(__COUNTER__)), noinline, optimize("O2")))
+    __attribute__((section(".time_critical.core" MEML_STR(n) ".code." MEML_STR(__COUNTER__))))
 
 #define MEML_DATA_ON_CORE(n) \
     __attribute__((section(".core" MEML_STR(n) ".bank"), used, aligned(8)))

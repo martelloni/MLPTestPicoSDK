@@ -8,11 +8,21 @@ Checks the four guarantees Step 1 of plan-mlpCoreLocalPrompt.md establishes:
      [0x20000000, 0x20040000).
   3. The flash-resident dataset section (.flash) has no SRAM execution
      address.
-  4. Every mlp/ hot-path symbol (SMLP_CODE_ATTR-tagged, "smlp::"-namespaced)
-     lands in the bank the selected MEML_MLP_RUNS_ON_CORE value implies, and
-     none of it leaks into the other core's bank. This is the check that
-     would have caught a hot-path function silently missing its placement
-     hook, or a project TU including mlp/*.h before binding MemoryDefs.hpp.
+  4. Every mlp/ hot-path symbol (SMLP_CODE_ATTR-tagged, "smlp::"-namespaced,
+     including const member functions and for_each_layer's lambdas) that
+     still exists as a standalone symbol lands in the bank the selected
+     MEML_MLP_RUNS_ON_CORE value implies, and none of it leaks into the other
+     core's bank. This is the check that would have caught a hot-path
+     function silently missing its placement hook, or a project TU including
+     mlp/*.h before binding MemoryDefs.hpp.
+  5. The MLPOpticalRecognition entry points (Initialise, Train, and Predict
+     in "tests" mode) are present and in the selected bank. Since
+     MEML_RUNS_ON_CORE(_CODE) no longer forces `noinline`, most of the mlp/
+     hot path inlines into these and leaves no symbol of its own -- this
+     check is what still proves the whole thing landed in the right place.
+  6. ("benchmarks" mode only) None of nn::fmul/nn::scale/smlp::activate
+     appear as their own out-of-line symbol -- a regression canary for the
+     exact "one call per weight" slowdown this scheme was fixed to avoid.
 
 For the unpinned configuration (--core ""), Step 7 removes the per-bank
 placement scheme entirely, so none of the above applies; the only check is
@@ -115,13 +125,42 @@ def _is_ctor_or_dtor(mangled_name):
     return bool(_CTOR_DTOR_MARKER.search(mangled_name))
 
 
+# Namespace/class prefixes a mlp hot-path or entry-point symbol can start
+# with. Widened from the original "_ZN4smlp" alone, which only matched
+# ordinary (non-const, non-lambda) member functions defined directly inside
+# namespace smlp: const member functions mangle as "_ZNK4smlp...", closures
+# passed to for_each_layer mangle as "_ZZN4smlp..."/"_ZZNK4smlp..." (the
+# Itanium ABI's "local entity" marker for a name nested inside a function
+# body), and the project-side entry facade lives in its own top-level class
+# rather than namespace smlp.
+_MLP_SYMBOL_PREFIXES = ("_ZN4smlp", "_ZNK4smlp", "_ZZN4smlp", "_ZZNK4smlp", "_ZN21MLPOpticalRecognition")
+
+# Setup-only helpers used by unit tests, not part of the trained hot path:
+# allocating, called at most once per test, and historically invisible to the
+# "_ZN4smlp"-only prefix check. Now that the prefix check also matches their
+# "_ZNK4smlp"/const-qualified mangling, they would otherwise be flagged for
+# sitting in core 0's bank regardless of the selected core -- exempt them
+# explicitly rather than tagging them with SMLP_CODE_ATTR, which would pull
+# an allocating path into the hot-path bank for no benefit.
+_MLP_SYMBOL_ALLOWLIST = ("get_weights_impl", "set_weights_impl", "get_biases_impl", "set_biases_impl")
+
+# Scalar helpers that must stay inlined into their tagged caller once
+# MEML_RUNS_ON_CORE/MEML_RUNS_ON_CORE_CODE stopped forcing `noinline`. Any of
+# these surviving as an out-of-line symbol means the compiler emitted a real
+# call inside AccumulateGradients' per-weight loop again -- the exact
+# regression ("Why the pinned build runs 1.7x slower") this canary exists to
+# catch before it costs another benchmark run to notice.
+_MLP_INLINE_CANARY_NAMES = ("fmul", "scale", "activate")
+
+
 def check_mlp_symbol_placement(symbols, core, errors):
-    """Every symbol actually DEFINED in namespace smlp must sit in the selector's
-    bank. Matching must be a prefix check (_ZN4smlp...), not a substring check:
-    a symbol like std::get<0>(tuple<smlp::StaticLayer<...>>) mentions "smlp" in
-    its mangled template arguments but is a libstdc++ symbol we have no
-    attribute hook into -- it is not something SMLP_CODE_ATTR could ever tag,
-    so it must not be flagged as a coverage regression.
+    """Every symbol actually DEFINED in namespace smlp, or in the
+    MLPOpticalRecognition entry facade, must sit in the selector's bank.
+    Matching must be a prefix check, not a substring check: a symbol like
+    std::get<0>(tuple<smlp::StaticLayer<...>>) mentions "smlp" in its mangled
+    template arguments but is a libstdc++ symbol we have no attribute hook
+    into -- it is not something SMLP_CODE_ATTR could ever tag, so it must not
+    be flagged as a coverage regression.
     """
     if core == "1":
         expected_lo, expected_hi = RAM1_BASE, RAM1_END
@@ -132,11 +171,9 @@ def check_mlp_symbol_placement(symbols, core, errors):
 
     mlp_symbols = [
         (addr, name) for addr, name in symbols
-        if name.startswith("_ZN4smlp") and not _is_ctor_or_dtor(name)
+        if name.startswith(_MLP_SYMBOL_PREFIXES) and not _is_ctor_or_dtor(name)
+        and not any(allowed in name for allowed in _MLP_SYMBOL_ALLOWLIST)
     ]
-    if not mlp_symbols:
-        fail(errors, "no smlp:: symbols found in the ELF -- did the build actually link mlp/?")
-        return
 
     for addr, name in mlp_symbols:
         if forbidden_lo <= addr < forbidden_hi:
@@ -152,6 +189,57 @@ def check_mlp_symbol_placement(symbols, core, errors):
                 f"mlp hot-path symbol '{name}' at {addr:#x} is outside both "
                 "known SRAM banks",
             )
+
+
+def check_mlp_entry_points(symbols, core, errors, mode):
+    """Now that the hot-path helpers are expected to inline away, most of
+    namespace smlp may leave no standalone symbol at all in an optimized
+    build -- so the old "did the build actually link mlp/?" sanity check
+    (which required at least one _ZN4smlp symbol to exist) would fail on a
+    fully-inlined build for the wrong reason. Require instead that the
+    project-facing entry points that MUST stay tagged (everything reaching
+    the MLP from outside inlines into these, or calls out to them) are
+    present in the ELF and in the selected core's bank.
+    """
+    expected_lo, expected_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
+    required_methods = ("Initialise", "Train") + (("Predict",) if mode == "tests" else ())
+
+    for method in required_methods:
+        matches = [
+            (addr, name) for addr, name in symbols
+            if name.startswith("_ZN21MLPOpticalRecognition") and method in name
+            and not _is_ctor_or_dtor(name)
+        ]
+        if not matches:
+            fail(errors, f"MLPOpticalRecognition::{method} entry point not found in the ELF")
+            continue
+        for addr, name in matches:
+            if not (expected_lo <= addr < expected_hi):
+                fail(
+                    errors,
+                    f"MLPOpticalRecognition entry point '{name}' at {addr:#x} is outside "
+                    f"the selected core's bank [{expected_lo:#x}, {expected_hi:#x})",
+                )
+
+
+def check_mlp_inlining_canary(symbols, errors):
+    """Benchmarks-mode regression canary: fail if a scalar per-weight helper
+    that should be fully inlined into the training loop shows up as its own
+    out-of-line symbol. See _MLP_INLINE_CANARY_NAMES.
+    """
+    for addr, name in symbols:
+        if not name.startswith(_MLP_SYMBOL_PREFIXES) or _is_ctor_or_dtor(name):
+            continue
+        for canary in _MLP_INLINE_CANARY_NAMES:
+            if canary in name:
+                fail(
+                    errors,
+                    f"'{name}' at {addr:#x} is an out-of-line symbol, but {canary}() "
+                    "must inline into its caller -- this is the exact call-per-weight "
+                    "regression that made the pinned build 1.7x slower; check that "
+                    "MEML_RUNS_ON_CORE(_CODE) did not regain noinline/optimize()",
+                )
+                break
 
 
 def check_placement_probe(symbols, core, errors):
@@ -259,10 +347,12 @@ def main():
             check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
         check_flash_outside_ram(sections, errors)
         check_mlp_symbol_placement(symbols, args.core, errors)
+        check_mlp_entry_points(symbols, args.core, errors, args.mode)
         if args.mode == "tests":
             check_placement_probe(symbols, args.core, errors)
         else:
             check_benchmark_placement(symbols, args.core, errors)
+            check_mlp_inlining_canary(symbols, errors)
 
     if errors:
         print(f"validate_memory_placement: FAIL ({len(errors)} issue(s)) "
