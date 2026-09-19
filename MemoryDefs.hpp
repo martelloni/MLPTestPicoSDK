@@ -84,30 +84,50 @@
 #if defined(MEML_MLP_RUNS_ON_CORE)
 #if MEML_MLP_RUNS_ON_CORE == 0
 #define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(0)
-#define MEML_MLP_CODE_MULTI MEML_RUNS_ON_CORE(0)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(0)
 #elif MEML_MLP_RUNS_ON_CORE == 1
 #define MEML_MLP_CODE MEML_RUNS_ON_CORE_CODE(1)
-#define MEML_MLP_CODE_MULTI MEML_RUNS_ON_CORE(1)
 #define MEML_MLP_DATA MEML_DATA_ON_CORE(1)
 #else
 #error "MEML_MLP_RUNS_ON_CORE must be 0 or 1 when defined."
 #endif
 #else
 #define MEML_MLP_CODE
-#define MEML_MLP_CODE_MULTI
 #define MEML_MLP_DATA
 #endif
+
+/* SMLP_CODE_ATTR_MULTI is bound to `always_inline` -- never to a `section`
+ * attribute -- in every configuration, including the unpinned one. A
+ * `section` attribute on for_each_layer<F, I> would be attached to its ONE
+ * textual definition (mlp/StaticMLP.h), so __COUNTER__ there is evaluated
+ * exactly once per translation unit: every lambda closure F and recursion
+ * depth I that instantiates the template -- and, worse, the SAME
+ * instantiation re-emitted (as a weak/COMDAT symbol) from a DIFFERENT TU
+ * that happened to consume a different number of __COUNTER__ tokens earlier
+ * in its own translation -- would collide on one literal section string.
+ * That reintroduces exactly the COMDAT-group-per-section-name folding
+ * hazard described above for MEML_RUNS_ON_CORE(n): the linker keeps only
+ * one TU's copy of the group and silently no-ops every call to whichever
+ * instantiations got discarded with it.
+ *
+ * `always_inline` sidesteps the problem instead of working around it:
+ * for_each_layer<F, I> only ever calls for_each_layer<F, I+1> (a distinct
+ * instantiation, not a real recursive call) until I+1 == kNumLayers, so it
+ * is a finite, compile-time-unrolled call chain that GCC can always inline
+ * in full. Forcing that (rather than leaving it to -O2/-O3 heuristics, which
+ * may or may not keep an out-of-line copy) guarantees for_each_layer never
+ * exists as a standalone symbol needing its own bank placement -- its
+ * machine code always lands inside whichever SMLP_CODE_ATTR-tagged caller
+ * pulled it in, in every one of the three memory configurations alike.
+ */
+#define MEML_MLP_CODE_MULTI __attribute__((always_inline))
 
 #undef SMLP_CODE_ATTR
 #undef SMLP_CODE_ATTR_MULTI
 #undef SMLP_DATA_ATTR
 #define SMLP_CODE_ATTR MEML_MLP_CODE
-// Reuses MEML_RUNS_ON_CORE(n) (which carries `used`) rather than
-// MEML_RUNS_ON_CORE_CODE(n): see mlp/Placement.h's SMLP_CODE_ATTR_MULTI
-// comment for why multiply-instantiated hot-path templates need `used` to
-// avoid a GCC -O2/-O3 "section type conflict" that MEML_RUNS_ON_CORE_CODE's
-// __COUNTER__-shared section name otherwise triggers across instantiations.
+// See MEML_MLP_CODE_MULTI's comment above for why this is `always_inline`
+// rather than a `section` attribute, in every configuration.
 #define SMLP_CODE_ATTR_MULTI MEML_MLP_CODE_MULTI
 #define SMLP_DATA_ATTR MEML_MLP_DATA
 
