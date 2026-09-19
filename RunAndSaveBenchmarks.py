@@ -90,6 +90,7 @@ def log(message: str) -> None:
 
 CSV_FIELDS = [
     "timestamp",
+    "git_commit",
     "build_config",
     "condition",
     "clock_freq_mhz",
@@ -156,6 +157,34 @@ BUILD_CONFIGS = [
 
 class BenchmarkError(RuntimeError):
     pass
+
+
+def get_git_commit_hash() -> str:
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def ensure_git_clean() -> None:
+    """Refuse to run unless the working tree exactly matches HEAD.
+
+    Results are tagged with the current commit hash so runs can be traced
+    back to the exact source that produced them; that traceability is worthless
+    if uncommitted changes (tracked or untracked, anything `git status` would
+    show) could have affected the build.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    if result.stdout.strip():
+        raise BenchmarkError(
+            "Git working tree has uncommitted changes and/or untracked files "
+            "(commit, stash, or remove them first so results can be tied to an exact commit):\n"
+            f"{result.stdout}"
+        )
 
 
 def run_cmd(cmd: list) -> None:
@@ -288,7 +317,7 @@ def capture_run(port: str, baudrate: int, overall_timeout_s: float, log_path: Pa
     raise BenchmarkError(f"Timed out after {overall_timeout_s:.0f}s waiting for '{END_MARKER}'")
 
 
-def parse_transcript(text: str, build_config: str, timestamp: str, log_file: str) -> list[dict]:
+def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
     clock_match = RE_CLOCK.search(text)
     clock_mhz = clock_match.group(1) if clock_match else ""
 
@@ -329,6 +358,7 @@ def parse_transcript(text: str, build_config: str, timestamp: str, log_file: str
 
     common = dict(
         timestamp=timestamp,
+        git_commit=git_commit,
         build_config=build_config,
         clock_freq_mhz=clock_mhz,
         epochs_per_session=EXPECTED_EPOCHS_PER_SESSION,
@@ -414,7 +444,7 @@ SAMPLE_TRANSCRIPT_NAIVE = SAMPLE_TRANSCRIPT_PINNED.replace(
 
 
 def run_self_test() -> None:
-    pinned_rows = parse_transcript(SAMPLE_TRANSCRIPT_PINNED, "core0", "20260101_000000", "sample.log")
+    pinned_rows = parse_transcript(SAMPLE_TRANSCRIPT_PINNED, "core0", "20260101_000000", "deadbeef", "sample.log")
     assert len(pinned_rows) == 2
     flood, dormant = pinned_rows
     assert flood["condition"] == "flooding"
@@ -430,7 +460,7 @@ def run_self_test() -> None:
     assert flood["timing_verdict"] == "PASS"
     assert flood["timing_avg_diff_pct"] == "0.37"
 
-    naive_rows = parse_transcript(SAMPLE_TRANSCRIPT_NAIVE, "naive", "20260101_000000", "sample.log")
+    naive_rows = parse_transcript(SAMPLE_TRANSCRIPT_NAIVE, "naive", "20260101_000000", "deadbeef", "sample.log")
     assert naive_rows[0]["timing_verdict"] == "EXPECTED-DEVIATION"
     assert naive_rows[0]["timing_avg_diff_pct"] == "12.30"
 
@@ -484,6 +514,13 @@ def main(argv=None) -> int:
     if not Path(picotool).exists() and shutil.which(picotool) is None:
         sys.exit(f"picotool not found at '{picotool}' and not on PATH")
 
+    try:
+        ensure_git_clean()
+    except BenchmarkError as e:
+        sys.exit(str(e))
+    git_commit = get_git_commit_hash()
+    log(f"Git commit: {git_commit}")
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     configs_by_name = {c.name: c for c in BUILD_CONFIGS}
@@ -507,7 +544,7 @@ def main(argv=None) -> int:
         log(f"Waiting for board on {args.serial_port} (timeout {args.timeout:.0f}s)...")
         transcript = capture_run(args.serial_port, args.baudrate, args.timeout, log_path)
 
-        rows = parse_transcript(transcript, cfg.name, timestamp, str(log_path.relative_to(REPO_ROOT)))
+        rows = parse_transcript(transcript, cfg.name, timestamp, git_commit, str(log_path.relative_to(REPO_ROOT)))
         append_rows_to_csv(rows)
         log(f"Saved {len(rows)} row(s) for {cfg.name} to {CSV_PATH}; raw log at {log_path}")
 
