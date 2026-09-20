@@ -73,6 +73,16 @@ SECTIONS
         __core1_for_each_layer_end__ = .;
     } > CORE1_RAM AT> RAM_STORE
 
+    /* Like .time_critical.core1.code's own __core1_code_load__
+     * (section_extra_post_text.incl): this section's VMA (CORE1_RAM) differs
+     * from its LMA (flash), so `copy_to_ram`'s normal startup copy -- which
+     * only knows about the SDK's own .text/.data tables -- never touches it.
+     * memory/CoreSectionInit.cpp's meml_core1_preinit() copies it explicitly,
+     * using this symbol, before any constructor (and hence any code that
+     * could call into it) runs.
+     */
+    __core1_for_each_layer_load__ = LOADADDR(.time_critical.core1.for_each_layer);
+
     ASSERT((__core1_for_each_layer_end__ <= 0x2007fff0),
         "core1 for_each_layer redirect exceeds the 256 KiB SRAM bank")
 }

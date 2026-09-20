@@ -13,6 +13,14 @@ extern uint32_t __core1_bank_start__[];
 extern uint32_t __core1_bank_end__[];
 extern uint32_t __core0_bank_start__[];
 extern uint32_t __core0_bank_end__[];
+#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 1
+// Only defined by linker/core1-only/section_copy_to_ram_text.incl, which is
+// only added to the link for the core-1-pinned build (see CMakeLists.txt) --
+// referencing these unconditionally would fail to link for core 0.
+extern uint32_t __core1_for_each_layer_start__[];
+extern uint32_t __core1_for_each_layer_end__[];
+extern const uint32_t __core1_for_each_layer_load__[];
+#endif
 }
 
 /**
@@ -36,6 +44,19 @@ extern "C" void meml_core1_preinit() {
     while (destination != __core1_code_end__) {
         *destination++ = *source++;
     }
+
+#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 1
+    destination = __core1_for_each_layer_start__;
+    source = __core1_for_each_layer_load__;
+
+    // Same as above, for mlp/StaticMLP.h's for_each_layer<F, I> instantiations
+    // (see linker/core1-only/section_copy_to_ram_text.incl): its VMA
+    // (CORE1_RAM) differs from its LMA (flash), so the SDK's own startup copy
+    // never touches it either.
+    while (destination != __core1_for_each_layer_end__) {
+        *destination++ = *source++;
+    }
+#endif
 
     destination = __core1_bank_start__;
 
