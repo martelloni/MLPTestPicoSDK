@@ -117,6 +117,31 @@ if(NOT MEML_MLP_RUNS_ON_CORE STREQUAL "")
             FILES memory_extra.incl section_extra_post_text.incl section_extra_post_data.incl)
 endif()
 
+# Core-1-pinned only: redirects mlp/StaticMLP.h's for_each_layer<F, I>
+# instantiations (an untagged template, safe by construction via
+# -ffunction-sections' own per-instantiation auto-naming -- see
+# MemoryDefs.hpp's MEML_MLP_CODE_MULTI comment) into CORE1_RAM ahead of the
+# SDK's own .text* catch-all, instead of paying a real call-overhead cost to
+# place them via an ordinary tagged wrapper. Left out of the unpinned and
+# core-0-pinned builds entirely: both already get this code into the right
+# bank for free (core 0's bank IS the SDK's default RAM window), and
+# including this override there would incorrectly redirect their
+# for_each_layer instantiations into CORE1_RAM too. See
+# linker/section_copy_to_ram_text.incl for the full reasoning.
+#
+# This lives in its own linker/core1-only subdirectory, not linker/ itself:
+# pico_add_linker_script_override_path works by adding its path argument to
+# the linker's INCLUDE search path wholesale, not by scoping visibility to
+# just the FILES named in one particular call -- so a same-named override
+# dropped into linker/ (already unconditionally on the search path for both
+# pinned configs, via the call above) would resolve for core 0 too, wrongly
+# redirecting ITS for_each_layer instantiations into CORE1_RAM as well.
+if(MEML_MLP_RUNS_ON_CORE STREQUAL "1")
+    pico_add_linker_script_override_path(MLPTestPicoSDK
+            ${CMAKE_CURRENT_SOURCE_DIR}/linker/core1-only
+            FILES section_copy_to_ram_text.incl)
+endif()
+
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
 

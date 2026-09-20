@@ -96,19 +96,79 @@
 #define MEML_MLP_DATA
 #endif
 
-// mlp/StaticMLP.h's for_each_layer_impl<F, I> (a member function template
-// instantiated many times per TU with genuinely different F) is NOT bound to
-// any of the macros above, and carries no SMLP_CODE_ATTR-style hook at all:
-// see its own comment and MEML_FOR_EACH_LAYER's, next to its definition, for
-// why an explicit section on a multiply-instantiated template is unsafe, and
-// how giving each *call site* (not each template instantiation) its own
-// uniquely SMLP_CODE_ATTR-tagged, noinline wrapper solves it -- verified to
-// produce byte-identical (address-normalized) disassembly across all three
-// memory configurations.
+/* SMLP_CODE_ATTR_MULTI is always left blank, in every configuration
+ * including the core-1-pinned build. Two other things were tried and both
+ * measured worse:
+ *
+ * 1. An explicit `section(...)` attribute on for_each_layer<F, I> would be
+ *    attached to its ONE textual definition (mlp/StaticMLP.h), so a
+ *    __COUNTER__-based name there is fixed once per translation unit: every
+ *    lambda closure F and recursion depth I that instantiates the template
+ *    -- and, worse, the SAME instantiation re-emitted (as a weak/COMDAT
+ *    symbol) from a DIFFERENT TU that consumed a different number of
+ *    __COUNTER__ tokens earlier in its own translation -- would collide on
+ *    one literal section string, reintroducing the COMDAT-group-per-
+ *    section-name folding hazard described above for MEML_RUNS_ON_CORE(n).
+ *
+ * 2. Forcing `always_inline` on the template, or routing every call site
+ *    through a `noinline` wrapper, both sidestep that hazard -- but both
+ *    impose one fixed structure at every one of the ~15 for_each_layer call
+ *    sites across mlp/StaticMLP.h, instead of letting the compiler choose
+ *    per call site between fully inlining and keeping one small shared
+ *    out-of-line copy reached via `bl`. Measured on hardware: `always_inline`
+ *    everywhere cost ~4% against the unpinned build's original structure;
+ *    a `noinline` wrapper applied to every configuration cost even more
+ *    (~44.5s vs ~42.9s for both the unpinned and core-0-pinned builds) and
+ *    additionally regressed the unpinned build specifically under RAM
+ *    contention (its "flooding" condition went from ~48.1s to ~51.2s -- the
+ *    worst on record). Left blank, each instantiation gets its own
+ *    auto-generated `.text.<mangled-name>` section, already uniquely keyed
+ *    to that one mangled symbol -- ordinary, safe COMDAT grouping, no risk
+ *    of two different instantiations colliding on one name, since none
+ *    share one -- and the compiler is free to pick the fastest structure.
+ *
+ * That auto-named `.text._ZN...` section carries no bank hint, though, and
+ * simply falls through the SDK's own default `.text*` catch-all into the
+ * ordinary default-RAM window. For the unpinned build that is fine by
+ * construction, and for a core-0-pinned build it is ALSO already correct,
+ * for a non-obvious reason: core 0's bank *is* that same default RAM region
+ * (0x20000000-0x2003ffff), so leaving for_each_layer untagged there is a
+ * free, correct no-op -- verified by diffing the resulting disassembly
+ * against the unpinned build byte-for-byte (address-normalized). Core 1's
+ * bank (CORE1_RAM, 0x20040000+) is a genuinely separate region, so the same
+ * trick doesn't reach it on its own.
+ *
+ * Rather than pay a call-overhead cost for core 1 too, linker/
+ * section_copy_to_ram_text.incl -- a project override of the SDK's own
+ * fragment of that name, added to the build ONLY for the core-1-pinned
+ * configuration (see CMakeLists.txt) -- redirects any auto-named section
+ * whose mangled name contains "for_each_layer" into CORE1_RAM, ahead of an
+ * otherwise-unmodified copy of the SDK's own general `.text*` catch-all
+ * later in that same file. This is safe (see mlp/StaticMLP.h's
+ * for_each_layer comment for the full reasoning) and, unlike an earlier
+ * attempt at this, does NOT risk the boot image: this project uses
+ * `copy_to_ram` binaries, whose vector table lives in its own `.flashtext`
+ * output section (section_copy_to_ram_flashtext.incl), textually and
+ * positionally separate from the `.text*` catch-all in
+ * section_copy_to_ram_text.incl -- unlike the plain "flash" binary type's
+ * section_default_text.incl, where they share one output-section block.
+ * Inserting a new output section ahead of the catch-all in
+ * section_copy_to_ram_text.incl therefore cannot land before the vector
+ * table in flash; the only files that can are earlier in
+ * sections_copy_to_ram_text.incl's own include order (section_flash_begin,
+ * section_copy_to_ram_flashtext, section_boot2, ...), none of which this
+ * project touches.
+ */
+#define MEML_MLP_CODE_MULTI
 
 #undef SMLP_CODE_ATTR
+#undef SMLP_CODE_ATTR_MULTI
 #undef SMLP_DATA_ATTR
 #define SMLP_CODE_ATTR MEML_MLP_CODE
+// See MEML_MLP_CODE_MULTI's comment above: always blank. Core 1's own
+// placement need is handled at the linker level instead (see linker/
+// section_copy_to_ram_text.incl), not via this attribute.
+#define SMLP_CODE_ATTR_MULTI MEML_MLP_CODE_MULTI
 #define SMLP_DATA_ATTR MEML_MLP_DATA
 
 #endif // __MEMORY_DEFS_HPP__
