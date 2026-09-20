@@ -96,69 +96,19 @@
 #define MEML_MLP_DATA
 #endif
 
-/* SMLP_CODE_ATTR_MULTI: blank for the unpinned build and the core-0-pinned
- * build; `always_inline` ONLY for the core-1-pinned build. Two things this
- * used to try both turned out to be wrong for the general case:
- *
- * 1. An explicit `section(...)` attribute on for_each_layer<F, I> would be
- *    attached to its ONE textual definition (mlp/StaticMLP.h), so a
- *    __COUNTER__-based name there is fixed once per translation unit: every
- *    lambda closure F and recursion depth I that instantiates the template
- *    -- and, worse, the SAME instantiation re-emitted (as a weak/COMDAT
- *    symbol) from a DIFFERENT TU that consumed a different number of
- *    __COUNTER__ tokens earlier in its own translation -- would collide on
- *    one literal section string, reintroducing the COMDAT-group-per-
- *    section-name folding hazard described above for MEML_RUNS_ON_CORE(n).
- *
- * 2. Forcing `always_inline` everywhere sidesteps that hazard, but measured
- *    ~4% slower on hardware than leaving the attribute blank -- confirmed by
- *    comparing disassembly across commits: with `always_inline`, EVERY call
- *    site gets its own full copy of for_each_layer's 3-layer-unrolled body;
- *    left blank, -ffunction-sections (on by default in this SDK) + ordinary
- *    vague linkage lets the compiler keep ONE small (~2.5 KiB) out-of-line
- *    copy per (F, I), reused via `bl` -- smaller footprint, measurably
- *    faster, and exactly what the unpinned build already did originally.
- *    Left blank, each instantiation gets its own auto-generated
- *    `.text.<mangled-name>` section, already uniquely keyed to that one
- *    mangled symbol -- ordinary, safe COMDAT grouping, no risk of two
- *    different instantiations colliding on one name, since none share one.
- *
- * That auto-named `.text._ZN...` section carries no bank hint, though, and
- * simply falls through the SDK's own default `.text*` catch-all
- * (section_default_text.incl) into the ordinary default-RAM window. For the
- * unpinned build that is fine by construction, and for a core-0-pinned
- * build it is ALSO already correct, for a non-obvious reason: core 0's bank
- * *is* that same default RAM region (0x20000000-0x2003ffff), so leaving
- * for_each_layer untagged there is a free, correct no-op -- verified by
- * diffing the resulting disassembly against the unpinned build byte-for-
- * byte (address-normalized). Core 1's bank (CORE1_RAM, 0x20040000+) is a
- * genuinely separate region, so the same trick doesn't reach it.
- *
- * A linker-side fix for core 1 (redirect the auto-named section into
- * CORE1_RAM before the SDK's default catch-all claims it) was investigated
- * and rejected: the only injection point earlier than that catch-all
- * (linker/memory_extra.incl, processed before sections_default_text.incl)
- * would also place the redirected section's flash LOAD address before
- * section_flash_begin.incl/section_boot2.incl's content -- i.e. before the
- * vector table and boot2 image header, which RP2350 requires at the start
- * of flash. That risks an unbootable image, so core 1 keeps `always_inline`
- * and pays the ~4% cost; the unpinned and core-0 builds do not.
- */
-#if defined(MEML_MLP_RUNS_ON_CORE) && MEML_MLP_RUNS_ON_CORE == 1
-#define MEML_MLP_CODE_MULTI __attribute__((always_inline))
-#else
-#define MEML_MLP_CODE_MULTI
-#endif
+// mlp/StaticMLP.h's for_each_layer_impl<F, I> (a member function template
+// instantiated many times per TU with genuinely different F) is NOT bound to
+// any of the macros above, and carries no SMLP_CODE_ATTR-style hook at all:
+// see its own comment and MEML_FOR_EACH_LAYER's, next to its definition, for
+// why an explicit section on a multiply-instantiated template is unsafe, and
+// how giving each *call site* (not each template instantiation) its own
+// uniquely SMLP_CODE_ATTR-tagged, noinline wrapper solves it -- verified to
+// produce byte-identical (address-normalized) disassembly across all three
+// memory configurations.
 
 #undef SMLP_CODE_ATTR
-#undef SMLP_CODE_ATTR_MULTI
 #undef SMLP_DATA_ATTR
 #define SMLP_CODE_ATTR MEML_MLP_CODE
-// See MEML_MLP_CODE_MULTI's comment above: blank for the unpinned and
-// core-0-pinned builds (ordinary vague linkage, core 0's bank already is the
-// default RAM window), `always_inline` only for the core-1-pinned build
-// (CORE1_RAM can't be reached by the same free ride).
-#define SMLP_CODE_ATTR_MULTI MEML_MLP_CODE_MULTI
 #define SMLP_DATA_ATTR MEML_MLP_DATA
 
 #endif // __MEMORY_DEFS_HPP__
