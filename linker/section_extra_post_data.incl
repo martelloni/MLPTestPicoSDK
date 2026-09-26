@@ -33,8 +33,21 @@ SECTIONS
      * default 256 KiB RAM region via ld's orphan-section placement, but that
      * placement is implicit and unverifiable from the ELF map; this makes it an
      * explicit, ASSERT-guarded guarantee instead.
+     *
+     * Aligned to 64 KiB (one RP2350 SRAM bank) rather than just 8 bytes: with
+     * only byte alignment, this section starts wherever .text/.data/.bss
+     * happen to end, so mlp_experiment_ (the MLP's ~95 KiB weight/activation
+     * state, the dominant occupant of this bank) can straddle two SRAM bank
+     * boundaries instead of one. Measured on hardware as build-core0's
+     * remaining timing gap against build-core1/build-naive after the .text
+     * placement fix (see linker/core0-only/section_copy_to_ram_text.incl):
+     * core-1's equivalent bank starts right after its own small copied-code
+     * header, and the unpinned build's equivalent object also lands with only
+     * one crossing, so core 0 was the outlier. Bank-aligning this section's
+     * start gives mlp_experiment_ the same one-crossing-or-fewer layout the
+     * other two builds already have.
      */
-    .core0_bank (NOLOAD) : ALIGN(8)
+    .core0_bank (NOLOAD) : ALIGN(0x10000)
     {
         __core0_bank_start__ = .;
         *(.core0.bank)
