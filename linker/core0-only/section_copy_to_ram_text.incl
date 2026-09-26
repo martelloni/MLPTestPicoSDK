@@ -1,0 +1,90 @@
+/* Project override of the Pico SDK's own
+ * pico_standard_link/script_include/section_copy_to_ram_text.incl, added to
+ * the build ONLY for the core-0-pinned configuration (see the
+ * MEML_MLP_RUNS_ON_CORE STREQUAL "0" guard around this override in
+ * CMakeLists.txt) -- core 1 and the unpinned build never see this file, and
+ * keep using their own copies (core 1's own core1-only override, or the
+ * SDK's unmodified default for the unpinned build).
+ *
+ * Root cause this works around: MEML_RUNS_ON_CORE_CODE(0) (see
+ * MemoryDefs.hpp) gives every tagged core-0 hot-path function -- including
+ * MLPOpticalRecognition::Initialise/Train -- an explicit
+ * `section(".time_critical.core0.code.N")` attribute. Neither that name nor
+ * any wildcard for it appears in the SDK's own .text output section
+ * (`*(.text*)` requires a literal ".text" prefix, which
+ * ".time_critical.core0.code.N" does not have), so those sections fall
+ * through to the LATER, more permissive `*(.time_critical*)` wildcard inside
+ * the SDK's OWN `.data` output section (section_copy_to_ram_data.incl) --
+ * confirmed by inspecting the linked ELF's own map file
+ * (MLPOpticalRecognition::Train showed up inside the `.data` output section,
+ * not `.text`). That still executes correctly (both output sections land in
+ * the same core-0 SRAM window, and `.data`'s own flash->RAM copy table
+ * entry -- see crt0.S's data_cpy_table -- copies it at boot like any other
+ * initialized data), so this was never a correctness bug. But it does mean
+ * core 0's tagged hot path was NOT co-located with any untagged code it
+ * calls (e.g. CMSIS-DSP's arm_dot_prod_f32(), which -- lacking any
+ * SMLP_CODE_ATTR hook of its own, see
+ * linker/core1-only/section_copy_to_ram_text.incl's comment for the same
+ * problem on core 1 -- lands in the ordinary `.text` output section): every
+ * core-0 build call from Train() into arm_dot_prod_f32() crosses between
+ * two separate output sections, unlike core 1 (which explicitly keeps its
+ * tagged code and arm_dot_prod_f32 together in one CORE1_RAM section) and
+ * unlike the unpinned build (where nothing is tagged at all, so everything
+ * naturally stays in one `.text` blob together). This was measured on
+ * hardware as a build-core0-specific regression when CMSIS-DSP was added
+ * (RunAndSaveBenchmarks.py's MLP core timing went up disproportionately more
+ * for build-core0 than for build-core1/build-naive).
+ *
+ * Fix: explicitly match `.time_critical.core0.code*` inside THIS project's
+ * own `.text` output section, ahead of where the SDK's `.data` section's
+ * catch-all would otherwise claim it (this file is included earlier in the
+ * SDK's master include tree than section_copy_to_ram_data.incl -- see
+ * memmap_copy_to_ram.ld's include list). No new copy-at-boot plumbing is
+ * needed: it becomes ordinary content of `.text`, which crt0 already copies
+ * from flash to RAM as one contiguous block via `.text`'s own existing
+ * __ram_text_source__/__ram_text_start__/__ram_text_end__ entry in
+ * data_cpy_table (crt0.S) -- unlike core 1's redirect, which needs its own
+ * CORE1_RAM region and hence its own manual copy in
+ * memory/CoreSectionInit.cpp.
+ *
+ * Below this rule, this file must stay identical to the SDK's own
+ * section_copy_to_ram_text.incl, so that upgrading the SDK only requires
+ * re-diffing this one file.
+ */
+
+/* Defines the following symbols for use by code:
+    __ram_text_start__, __ram_text_end__, __ram_text_source__
+*/
+
+SECTIONS
+{
+    .text : {
+        __ram_text_start__ = .;
+        *(.init)
+        *(.text*)
+        /* Project addition: see this file's header comment. Must appear
+         * before the SDK's .data output section (section_copy_to_ram_data.incl)
+         * is defined later in the master script, so this claims the input
+         * section first. */
+        *(.time_critical.core0.code*)
+        *(.fini)
+        /* Pull all c'tors into .text */
+        *crtbegin.o(.ctors)
+        *crtbegin?.o(.ctors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .ctors)
+        *(SORT(.ctors.*))
+        *(.ctors)
+        /* Followed by destructors */
+        *crtbegin.o(.dtors)
+        *crtbegin?.o(.dtors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .dtors)
+        *(SORT(.dtors.*))
+        *(.dtors)
+
+        *(.eh_frame*)
+        . = ALIGN(4);
+        __ram_text_end__ = .;
+    } > RAM AT> RAM_STORE
+    __ram_text_source__ = LOADADDR(.text);
+    . = ALIGN(4);
+}

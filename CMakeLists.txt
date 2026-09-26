@@ -175,6 +175,26 @@ if(MEML_MLP_RUNS_ON_CORE STREQUAL "1")
             FILES section_copy_to_ram_text.incl)
 endif()
 
+# Core-0-pinned only: MEML_RUNS_ON_CORE_CODE(0)-tagged functions (e.g.
+# MLPOpticalRecognition::Initialise/Train) get an explicit
+# ".time_critical.core0.code.N" section that the SDK's own .text output
+# section rule (`*(.text*)`) does not match, so without this override they
+# fall through to the SDK's `.data` output section's later, more permissive
+# `*(.time_critical*)` catch-all instead -- still correct (same core-0 SRAM
+# window, still copied at boot via .data's own copy-table entry), but it
+# means core 0's tagged hot path was never co-located with untagged code it
+# calls into (e.g. CMSIS-DSP's arm_dot_prod_f32(), which lands in the
+# ordinary `.text` section) the way core 1's build explicitly is. Measured on
+# hardware as a build-core0-specific timing regression once CMSIS-DSP was
+# added (RunAndSaveBenchmarks.py). See
+# linker/core0-only/section_copy_to_ram_text.incl for the full writeup and
+# the fix (folding ".time_critical.core0.code*" into `.text` itself).
+if(MEML_MLP_RUNS_ON_CORE STREQUAL "0")
+    pico_add_linker_script_override_path(MLPTestPicoSDK
+            ${CMAKE_CURRENT_SOURCE_DIR}/linker/core0-only
+            FILES section_copy_to_ram_text.incl)
+endif()
+
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
 
