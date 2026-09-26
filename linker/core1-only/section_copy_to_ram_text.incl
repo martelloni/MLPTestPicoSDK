@@ -15,32 +15,46 @@
  * that failure (validate_memory_placement.py caught it) before moving this
  * file here.
  *
- * Purpose: mlp/StaticMLP.h's for_each_layer<F, I> (a member function
- * template instantiated many times per translation unit with genuinely
- * different closure types F) can never carry an explicit `section`
- * attribute of its own -- see its comment in mlp/StaticMLP.h -- so every
- * configuration leaves it untagged and relies on -ffunction-sections giving
- * each instantiation its own safely-unique auto-named `.text._ZN...`
- * section instead. For the unpinned build and the core-0-pinned build
- * that's already enough: the SDK's own default RAM window IS core 0's
- * bank, so those auto-named sections land in the right place for free via
- * the ordinary catch-all below. Core 1's bank (CORE1_RAM) is a genuinely
- * separate region that the unmodified catch-all can never reach: GNU ld
- * claims each input section via the FIRST output-section rule (in the
- * fully-assembled script's text order) whose wildcard matches it, and there
- * is no way to exclude a section-name pattern from an already-matching
- * wildcard -- so reaching CORE1_RAM requires a rule that appears BEFORE the
- * catch-all, which is exactly what this override adds.
+ * Purpose: two kinds of hot-path code can never carry an explicit `section`
+ * attribute of their own, and so land in this redirect instead of the
+ * ordinary catch-all below:
  *
- * Safety of the wildcard match below: it matches on the mangled-name
- * substring "for_each_layer" (stable across every instantiation --
- * Itanium mangling embeds the literal identifier text, just prefixed by its
- * length and followed by template arguments). This can never accidentally
- * fold two different instantiations together the way an explicit,
- * textually-shared `section` attribute would: -ffunction-sections already
- * gives each instantiation its own distinct symbol/section name, so this
- * wildcard only ever redirects sections that were already one-to-one with a
- * single symbol.
+ *   1. mlp/StaticMLP.h's for_each_layer<F, I> (a member function template
+ *      instantiated many times per translation unit with genuinely
+ *      different closure types F) -- see its comment in mlp/StaticMLP.h --
+ *      which relies on -ffunction-sections giving each instantiation its
+ *      own safely-unique auto-named `.text._ZN...` section instead.
+ *   2. CMSIS-DSP's arm_dot_prod_f32(), pulled in from
+ *      CMSISDSP_dotprod (see CMakeLists.txt) to serve StaticLayer.h's
+ *      ARM_MATH_CM33 branch. It is third-party code with no SMLP_CODE_ATTR
+ *      hook at all, but forward() calls it on every dot product once that
+ *      branch is active, so it is just as much on the hot path as
+ *      for_each_layer -- and just as untagged. Matched by archive member
+ *      below rather than by mangled-name substring, since it's plain C with
+ *      no template instantiations to disambiguate.
+ *
+ * For the unpinned build and the core-0-pinned build this redirect isn't
+ * needed: the SDK's own default RAM window IS core 0's bank, so both kinds
+ * of untagged code land in the right place for free via the ordinary
+ * catch-all below. Core 1's bank (CORE1_RAM) is a genuinely separate region
+ * that the unmodified catch-all can never reach: GNU ld claims each input
+ * section via the FIRST output-section rule (in the fully-assembled
+ * script's text order) whose wildcard matches it, and there is no way to
+ * exclude a section-name pattern from an already-matching wildcard -- so
+ * reaching CORE1_RAM requires a rule that appears BEFORE the catch-all,
+ * which is exactly what this override adds.
+ *
+ * Safety of the wildcard matches below: the for_each_layer one matches on
+ * the mangled-name substring "for_each_layer" (stable across every
+ * instantiation -- Itanium mangling embeds the literal identifier text,
+ * just prefixed by its length and followed by template arguments). This can
+ * never accidentally fold two different instantiations together the way an
+ * explicit, textually-shared `section` attribute would: -ffunction-sections
+ * already gives each instantiation its own distinct symbol/section name, so
+ * this wildcard only ever redirects sections that were already one-to-one
+ * with a single symbol. The CMSISDSP_dotprod one matches by archive member
+ * name, which is exact and can't accidentally catch anything else linked
+ * into the image.
  *
  * Boot safety: this project uses `copy_to_ram` binaries. In that binary
  * type the vector table lives in its own `.flashtext` output section
@@ -65,12 +79,13 @@
 
 SECTIONS
 {
-    .time_critical.core1.for_each_layer : ALIGN(8)
+    .time_critical.core1.untagged_hotpath : ALIGN(8)
     {
-        __core1_for_each_layer_start__ = .;
+        __core1_untagged_hotpath_start__ = .;
         *(.text.*for_each_layer*)
+        *libCMSISDSP_dotprod.a:*(.text*)
         . = ALIGN(8);
-        __core1_for_each_layer_end__ = .;
+        __core1_untagged_hotpath_end__ = .;
     } > CORE1_RAM AT> RAM_STORE
 
     /* Like .time_critical.core1.code's own __core1_code_load__
@@ -81,10 +96,10 @@ SECTIONS
      * using this symbol, before any constructor (and hence any code that
      * could call into it) runs.
      */
-    __core1_for_each_layer_load__ = LOADADDR(.time_critical.core1.for_each_layer);
+    __core1_untagged_hotpath_load__ = LOADADDR(.time_critical.core1.untagged_hotpath);
 
-    ASSERT((__core1_for_each_layer_end__ <= 0x2007fff0),
-        "core1 for_each_layer redirect exceeds the 256 KiB SRAM bank")
+    ASSERT((__core1_untagged_hotpath_end__ <= 0x2007fff0),
+        "core1 untagged-hotpath redirect exceeds the 256 KiB SRAM bank")
 }
 
 /* ── Unmodified copy of the SDK's section_copy_to_ram_text.incl below ── */

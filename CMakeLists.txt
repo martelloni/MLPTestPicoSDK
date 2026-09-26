@@ -52,6 +52,39 @@ endif()
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+# Optimisation-3 spike: pull in CMSIS-DSP so arm_dot_prod_f32() is available and
+# the ARM_MATH_CM33 path in StaticLayer.h::forward() becomes reachable, so it
+# can be benchmarked against the hand-optimised multi-accumulator loop. The
+# Pico SDK itself ships only CMSIS-Core (register/intrinsic headers, via the
+# cmsis_core/cmsis_core_headers targets below pico_stdlib) -- no CMSIS-DSP.
+#
+# We fetch the CMSIS-DSP sources but deliberately do NOT build them via the
+# upstream Source/CMakeLists.txt target (which compiles every function group,
+# including Q7/Q15/Q31/f64 kernels we don't need): with this toolchain
+# (arm-none-eabi-gcc 15.2, -mcpu=cortex-m33 ... -mcmse -O3, as set by the Pico
+# SDK), several of those unrelated q31 kernels (e.g. arm_abs_q31.c) trigger a
+# compiler-internal segfault (ICE) at -O3. Since only the f32 dot product is
+# needed for this spike, build just that one translation unit instead.
+include(FetchContent)
+FetchContent_Declare(
+        CMSISDSP
+        GIT_REPOSITORY https://github.com/ARM-software/CMSIS-DSP.git
+        GIT_TAG v1.18.0
+)
+FetchContent_Populate(CMSISDSP)
+
+set(PICO_CMSIS_CORE_INCLUDE ${PICO_SDK_PATH}/src/rp2_common/cmsis/stub/CMSIS/Core/Include)
+
+add_library(CMSISDSP_dotprod STATIC
+        ${cmsisdsp_SOURCE_DIR}/Source/BasicMathFunctions/arm_dot_prod_f32.c)
+target_include_directories(CMSISDSP_dotprod PUBLIC
+        ${cmsisdsp_SOURCE_DIR}/Include
+        ${PICO_CMSIS_CORE_INCLUDE})
+target_include_directories(CMSISDSP_dotprod PRIVATE
+        ${cmsisdsp_SOURCE_DIR}/PrivateInclude)
+target_compile_definitions(CMSISDSP_dotprod PUBLIC ARM_MATH_LOOPUNROLL)
+add_library(CMSISDSP::CMSISDSP ALIAS CMSISDSP_dotprod)
+
 # Add executable. Default name is the project name, version 0.1
 
 set(MLPTestPicoSDK_SOURCES
@@ -167,12 +200,22 @@ pico_enable_stdio_usb(MLPTestPicoSDK 1)
 # Add the standard library to the build
 target_link_libraries(MLPTestPicoSDK
         pico_stdlib
-        pico_multicore)
+        pico_multicore
+        CMSISDSP::CMSISDSP)
 
 # Add the standard include files to the build
 target_include_directories(MLPTestPicoSDK PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
+
+# Optimisation-3 spike: define ARM_MATH_CM33 so StaticLayer.h::forward()'s
+# existing (previously-dead) CMSIS branch calls arm_dot_prod_f32() instead of
+# the scalar loop. __FPU_PRESENT=1 matches this target's hardware FPv5-SP
+# (already relied on unconditionally elsewhere in the build via
+# -mfloat-abi=softfp -mcpu=cortex-m33 -march=armv8-m.main+fp+dsp).
+target_compile_definitions(MLPTestPicoSDK PRIVATE
+        ARM_MATH_CM33
+        __FPU_PRESENT=1)
 
 pico_add_extra_outputs(MLPTestPicoSDK)
 

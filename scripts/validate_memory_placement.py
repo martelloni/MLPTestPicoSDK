@@ -23,6 +23,11 @@ Checks the four guarantees Step 1 of plan-mlpCoreLocalPrompt.md establishes:
   6. ("benchmarks" mode only) None of nn::fmul/nn::scale/smlp::activate
      appear as their own out-of-line symbol -- a regression canary for the
      exact "one call per weight" slowdown this scheme was fixed to avoid.
+  7. Third-party hot-path code with no SMLP_CODE_ATTR hook of its own (today:
+     CMSIS-DSP's arm_dot_prod_f32(), see check_cmsisdsp_symbol_placement)
+     lands in the selected core's bank too, via the untagged-hotpath linker
+     redirect -- not just left to the linker's default RAM window, which
+     would silently put it in core 0's bank regardless of MEML_MLP_RUNS_ON_CORE.
 
 For the unpinned configuration (--core ""), Step 7 removes the per-bank
 placement scheme entirely, so none of the above applies; the only check is
@@ -191,6 +196,52 @@ def check_mlp_symbol_placement(symbols, core, errors):
             )
 
 
+# Symbols contributed by third-party code (CMSISDSP_dotprod, see
+# CMakeLists.txt) that has no SMLP_CODE_ATTR hook of its own, and so is
+# invisible to check_mlp_symbol_placement's "_ZN4smlp"-prefix match. It is
+# still on the MLP hot path -- StaticLayer.h::forward()'s ARM_MATH_CM33
+# branch calls arm_dot_prod_f32() once per node -- so for a pinned build it
+# must land in the selected core's bank exactly like any other untagged
+# hot-path code, via the redirect in
+# linker/core1-only/section_copy_to_ram_text.incl. Extend this tuple if more
+# CMSIS-DSP functions are ever wired in.
+_CMSISDSP_SYMBOL_NAMES = ("arm_dot_prod_f32",)
+
+
+def check_cmsisdsp_symbol_placement(symbols, core, errors):
+    """Verify CMSIS-DSP's hot-path symbols landed in the selected core's bank.
+
+    This exists because the underlying bug is easy to miss silently: linking
+    in a third-party static library adds ordinary, untagged .text that the
+    default linker script places in the SDK's default RAM window (core 0's
+    bank) regardless of which core the build is actually pinned to. For the
+    core-1-pinned build that is wrong -- it means the timed core (core 1)
+    fetches this code from the OTHER core's SRAM bank on every dot product,
+    silently defeating the whole point of the per-core placement scheme.
+    """
+    expected_lo, expected_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
+    forbidden_lo, forbidden_hi = (RAM0_BASE, RAM0_END) if core == "1" else (RAM1_BASE, RAM1_END)
+
+    found = [(addr, name) for addr, name in symbols if name in _CMSISDSP_SYMBOL_NAMES]
+    if not found:
+        fail(errors, "expected CMSIS-DSP symbol(s) not found in the ELF -- was CMSISDSP_dotprod linked in?")
+        return
+    for addr, name in found:
+        if forbidden_lo <= addr < forbidden_hi:
+            fail(
+                errors,
+                f"CMSIS-DSP symbol '{name}' at {addr:#x} lands in the OTHER core's "
+                f"bank [{forbidden_lo:#x}, {forbidden_hi:#x}) -- add it to the "
+                "untagged-hotpath linker redirect for this core "
+                "(linker/core1-only/section_copy_to_ram_text.incl)",
+            )
+        elif not (expected_lo <= addr < expected_hi):
+            fail(
+                errors,
+                f"CMSIS-DSP symbol '{name}' at {addr:#x} is outside both known SRAM banks",
+            )
+
+
 def check_mlp_entry_points(symbols, core, errors, mode):
     """Now that the hot-path helpers are expected to inline away, most of
     namespace smlp may leave no standalone symbol at all in an optimized
@@ -347,6 +398,7 @@ def main():
             check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
         check_flash_outside_ram(sections, errors)
         check_mlp_symbol_placement(symbols, args.core, errors)
+        check_cmsisdsp_symbol_placement(symbols, args.core, errors)
         check_mlp_entry_points(symbols, args.core, errors, args.mode)
         if args.mode == "tests":
             check_placement_probe(symbols, args.core, errors)
