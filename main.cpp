@@ -40,6 +40,14 @@ using BenchmarkTest = test::TestNaiveMemoryLayout;
 #endif
 #endif
 
+// Set by CMake's RUN_TESTS_OR_BENCHMARKS="profile": a standalone per-layer
+// forward/backward cycle-count profiler (see tests/ProfileForwardBackward.hpp),
+// mutually exclusive with both the unit-test suite and the RAM-independence
+// benchmark.
+#if defined(MEML_RUN_PROFILE)
+#include "tests/ProfileForwardBackward.hpp"
+#endif
+
 int main()
 {
     stdio_init_all();
@@ -205,6 +213,17 @@ int main()
 #endif
 
     printf("\nTest completed.\n");
+#endif
+
+#if defined(MEML_RUN_PROFILE)
+    printf("Press any key to start profiling...\n");
+    while (stdio_usb_connected() == false) {
+        tight_loop_contents();
+    }
+    while (getchar_timeout_us((int64_t)-1) == PICO_ERROR_TIMEOUT) {
+        tight_loop_contents();
+    }
+    test::profile::RunForwardBackwardProfile();
 #endif
 
     while (true) {

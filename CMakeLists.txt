@@ -43,10 +43,10 @@ set(MEML_MLP_RUNS_ON_CORE "" CACHE STRING "Compile-time MLP placement selector: 
 # than both always being linked in. "tests" compiles and runs the unit-test
 # suite only; "benchmarks" skips every unit-test translation unit and builds
 # the benchmark suite (currently TestRAMIndependence only) instead.
-set(RUN_TESTS_OR_BENCHMARKS "tests" CACHE STRING "Build mode: 'tests' builds/runs the unit-test suite only; 'benchmarks' skips unit tests and builds the benchmark suite instead")
-set_property(CACHE RUN_TESTS_OR_BENCHMARKS PROPERTY STRINGS tests benchmarks)
-if(NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "tests" AND NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks")
-    message(FATAL_ERROR "RUN_TESTS_OR_BENCHMARKS must be 'tests' or 'benchmarks'.")
+set(RUN_TESTS_OR_BENCHMARKS "tests" CACHE STRING "Build mode: 'tests' builds/runs the unit-test suite only; 'benchmarks' skips unit tests and builds the benchmark suite instead; 'profile' builds a standalone per-layer forward/backward DWT cycle-count profiler")
+set_property(CACHE RUN_TESTS_OR_BENCHMARKS PROPERTY STRINGS tests benchmarks profile)
+if(NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "tests" AND NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks" AND NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
+    message(FATAL_ERROR "RUN_TESTS_OR_BENCHMARKS must be 'tests', 'benchmarks', or 'profile'.")
 endif()
 
 # Initialise the Raspberry Pi Pico SDK
@@ -78,6 +78,15 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/StaticMLPForwardAccumulatorTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
+elseif(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
+    # ProfileForwardBackward.cpp only ever names MLPOpticalRecognition::Net
+    # (a type alias), never instantiates the MLPOpticalRecognition class
+    # itself, so experiments/MLPOpticalRecognition.cpp's out-of-line
+    # Initialise/Train/Predict are never odr-used and don't need linking --
+    # just the dataset storage the profiler reads samples from.
+    list(APPEND MLPTestPicoSDK_SOURCES
+        dataset/Dataset.cpp
+        tests/ProfileForwardBackward.cpp)
 else()
     # TestRAMIndependence (pinned builds) and TestNaiveMemoryLayout (unpinned
     # build) both link against the real MLPOpticalRecognition facade rather
@@ -101,6 +110,8 @@ endif()
 
 if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
     target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_RUN_UNIT_TESTS)
+elseif(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
+    target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_RUN_PROFILE)
 else()
     target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
 endif()
@@ -169,6 +180,14 @@ pico_enable_stdio_usb(MLPTestPicoSDK 1)
 target_link_libraries(MLPTestPicoSDK
         pico_stdlib
         pico_multicore)
+
+# profile mode only: tests/ProfileForwardBackward.cpp reads the Cortex-M33
+# DWT cycle counter directly via CMSIS (RP2350.h/DWT/DCB), which isn't on the
+# include path through pico_stdlib alone -- cmsis_core is the SDK's own
+# interface target for it.
+if(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
+    target_link_libraries(MLPTestPicoSDK cmsis_core)
+endif()
 
 # Add the standard include files to the build
 target_include_directories(MLPTestPicoSDK PRIVATE

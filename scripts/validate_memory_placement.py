@@ -326,9 +326,11 @@ def main():
     parser.add_argument("--readelf", default="arm-none-eabi-readelf")
     parser.add_argument("--nm", default="arm-none-eabi-nm")
     parser.add_argument(
-        "--mode", default="tests", choices=("tests", "benchmarks"),
+        "--mode", default="tests", choices=("tests", "benchmarks", "profile"),
         help="RUN_TESTS_OR_BENCHMARKS value: 'tests' links MLPOpticalRecognitionTest.cpp's "
-             "g_experiment placement probe; 'benchmarks' does not, so that check is skipped.",
+             "g_experiment placement probe; 'benchmarks' does not, so that check is skipped. "
+             "'profile' is only meaningful with --core '' (no per-bank placement scheme to "
+             "check at all -- see check_scheme_absent).",
     )
     args = parser.parse_args()
 
@@ -341,6 +343,18 @@ def main():
         # there is nothing left to check except that the scheme was genuinely
         # skipped, not just that nothing happened to land in it.
         check_scheme_absent(sections, errors)
+    elif args.mode == "profile":
+        # ProfileForwardBackward.cpp only names MLPOpticalRecognition::Net (a
+        # type alias) and never instantiates the MLPOpticalRecognition class,
+        # so none of the tagged entry-point symbols the other modes require
+        # (Initialise/Train/Predict, g_experiment, mlp_experiment_/
+        # ram_flooder_) exist in this ELF at all -- there is nothing
+        # meaningful left to check beyond the generic bank-bounds/flash
+        # checks every pinned build gets.
+        check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
+        for name in CORE1_SECTIONS:
+            check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
+        check_flash_outside_ram(sections, errors)
     else:
         check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
         for name in CORE1_SECTIONS:

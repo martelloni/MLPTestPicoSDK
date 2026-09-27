@@ -53,7 +53,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem21401"
+DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem2101"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_PICOTOOL = Path.home() / ".pico-sdk" / "picotool" / "2.3.0" / "picotool" / "picotool"
 DEFAULT_RUN_TIMEOUT_S = 25 * 60  # each run takes ~15 min; leave headroom
