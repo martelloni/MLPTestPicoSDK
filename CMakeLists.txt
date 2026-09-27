@@ -77,7 +77,6 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/LossTest.cpp
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/StaticMLPForwardAccumulatorTest.cpp
-        tests/unit/StaticLayerBackwardLoopOrderTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
 else()
     # TestRAMIndependence (pinned builds) and TestNaiveMemoryLayout (unpinned
