@@ -52,39 +52,6 @@ endif()
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Optimisation-3 spike: pull in CMSIS-DSP so arm_dot_prod_f32() is available and
-# the ARM_MATH_CM33 path in StaticLayer.h::forward() becomes reachable, so it
-# can be benchmarked against the hand-optimised multi-accumulator loop. The
-# Pico SDK itself ships only CMSIS-Core (register/intrinsic headers, via the
-# cmsis_core/cmsis_core_headers targets below pico_stdlib) -- no CMSIS-DSP.
-#
-# We fetch the CMSIS-DSP sources but deliberately do NOT build them via the
-# upstream Source/CMakeLists.txt target (which compiles every function group,
-# including Q7/Q15/Q31/f64 kernels we don't need): with this toolchain
-# (arm-none-eabi-gcc 15.2, -mcpu=cortex-m33 ... -mcmse -O3, as set by the Pico
-# SDK), several of those unrelated q31 kernels (e.g. arm_abs_q31.c) trigger a
-# compiler-internal segfault (ICE) at -O3. Since only the f32 dot product is
-# needed for this spike, build just that one translation unit instead.
-include(FetchContent)
-FetchContent_Declare(
-        CMSISDSP
-        GIT_REPOSITORY https://github.com/ARM-software/CMSIS-DSP.git
-        GIT_TAG v1.18.0
-)
-FetchContent_Populate(CMSISDSP)
-
-set(PICO_CMSIS_CORE_INCLUDE ${PICO_SDK_PATH}/src/rp2_common/cmsis/stub/CMSIS/Core/Include)
-
-add_library(CMSISDSP_dotprod STATIC
-        ${cmsisdsp_SOURCE_DIR}/Source/BasicMathFunctions/arm_dot_prod_f32.c)
-target_include_directories(CMSISDSP_dotprod PUBLIC
-        ${cmsisdsp_SOURCE_DIR}/Include
-        ${PICO_CMSIS_CORE_INCLUDE})
-target_include_directories(CMSISDSP_dotprod PRIVATE
-        ${cmsisdsp_SOURCE_DIR}/PrivateInclude)
-target_compile_definitions(CMSISDSP_dotprod PUBLIC ARM_MATH_LOOPUNROLL)
-add_library(CMSISDSP::CMSISDSP ALIAS CMSISDSP_dotprod)
-
 # Add executable. Default name is the project name, version 0.1
 
 set(MLPTestPicoSDK_SOURCES
@@ -175,26 +142,6 @@ if(MEML_MLP_RUNS_ON_CORE STREQUAL "1")
             FILES section_copy_to_ram_text.incl)
 endif()
 
-# Core-0-pinned only: MEML_RUNS_ON_CORE_CODE(0)-tagged functions (e.g.
-# MLPOpticalRecognition::Initialise/Train) get an explicit
-# ".time_critical.core0.code.N" section that the SDK's own .text output
-# section rule (`*(.text*)`) does not match, so without this override they
-# fall through to the SDK's `.data` output section's later, more permissive
-# `*(.time_critical*)` catch-all instead -- still correct (same core-0 SRAM
-# window, still copied at boot via .data's own copy-table entry), but it
-# means core 0's tagged hot path was never co-located with untagged code it
-# calls into (e.g. CMSIS-DSP's arm_dot_prod_f32(), which lands in the
-# ordinary `.text` section) the way core 1's build explicitly is. Measured on
-# hardware as a build-core0-specific timing regression once CMSIS-DSP was
-# added (RunAndSaveBenchmarks.py). See
-# linker/core0-only/section_copy_to_ram_text.incl for the full writeup and
-# the fix (folding ".time_critical.core0.code*" into `.text` itself).
-if(MEML_MLP_RUNS_ON_CORE STREQUAL "0")
-    pico_add_linker_script_override_path(MLPTestPicoSDK
-            ${CMAKE_CURRENT_SOURCE_DIR}/linker/core0-only
-            FILES section_copy_to_ram_text.incl)
-endif()
-
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
 
@@ -220,22 +167,12 @@ pico_enable_stdio_usb(MLPTestPicoSDK 1)
 # Add the standard library to the build
 target_link_libraries(MLPTestPicoSDK
         pico_stdlib
-        pico_multicore
-        CMSISDSP::CMSISDSP)
+        pico_multicore)
 
 # Add the standard include files to the build
 target_include_directories(MLPTestPicoSDK PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
-
-# Optimisation-3 spike: define ARM_MATH_CM33 so StaticLayer.h::forward()'s
-# existing (previously-dead) CMSIS branch calls arm_dot_prod_f32() instead of
-# the scalar loop. __FPU_PRESENT=1 matches this target's hardware FPv5-SP
-# (already relied on unconditionally elsewhere in the build via
-# -mfloat-abi=softfp -mcpu=cortex-m33 -march=armv8-m.main+fp+dsp).
-target_compile_definitions(MLPTestPicoSDK PRIVATE
-        ARM_MATH_CM33
-        __FPU_PRESENT=1)
 
 pico_add_extra_outputs(MLPTestPicoSDK)
 
