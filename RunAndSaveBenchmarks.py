@@ -19,6 +19,11 @@ For each configuration this script:
      for the two RAMIndependence conditions (RAM-flooding other core vs.
      dormant other core), appending one CSV row per condition to
      benchmark_results/ram_independence_results.csv.
+  5. Builds the same configuration again with RUN_TESTS_OR_BENCHMARKS=profile
+     (tests/ProfileForwardBackward.cpp's standalone per-layer forward/backward
+     DWT cycle-count profiler), flashes and runs it, saves its own UART
+     transcript to benchmark_results/logs/, and appends one CSV row per
+     profiled stage to benchmark_results/profiling_results.csv.
 
 Per-session (per training-repeat) loss/accuracy is intentionally NOT
 extracted -- only the run-level metrics main.cpp prints (MLP core timing,
@@ -57,6 +62,7 @@ DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem2101"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_PICOTOOL = Path.home() / ".pico-sdk" / "picotool" / "2.3.0" / "picotool" / "picotool"
 DEFAULT_RUN_TIMEOUT_S = 25 * 60  # each run takes ~15 min; leave headroom
+DEFAULT_PROFILE_TIMEOUT_S = 5 * 60  # 100 iterations; just needs headroom past the two key-press gates
 PORT_REAPPEAR_TIMEOUT_S = 30.0
 HEARTBEAT_INTERVAL_S = 30.0
 KEY_RESEND_INTERVAL_S = 2.0
@@ -64,12 +70,22 @@ KEY_RESEND_INTERVAL_S = 2.0
 RESULTS_DIR = REPO_ROOT / "benchmark_results"
 LOG_DIR = RESULTS_DIR / "logs"
 CSV_PATH = RESULTS_DIR / "ram_independence_results.csv"
+PROFILE_CSV_PATH = RESULTS_DIR / "profiling_results.csv"
 
 # Mirrors main.cpp's kEpochsPerSession, which is not itself printed over UART.
 EXPECTED_EPOCHS_PER_SESSION = 10
 
 BENCHMARK_STARTED_MARKER = "Starting RAM independence test..."
 END_MARKER = "Test completed."
+
+# Profile builds (RUN_TESTS_OR_BENCHMARKS=profile) only ever print one
+# "Forward/backward cycle profile (...)" report and then sit forever in a
+# bare tight_loop_contents() with no further output and no "Test completed."
+# line -- so the report's own header doubles as the gate-cleared marker, and
+# the last stat line it prints ("full pass", from PrintStage(full_total))
+# doubles as the end-of-transcript marker.
+PROFILE_STARTED_MARKER = "Forward/backward cycle profile"
+PROFILE_END_MARKER = "full pass"
 
 # Bold cyan for this script's own status messages, so they stand out from
 # passed-through cmake/ninja/picotool output and raw UART lines, which are
@@ -132,12 +148,29 @@ RE_DORMANT_BLOCK = re.compile(
     r"Dormant run \(other core fully idle in WFE\):(.*?)Correctness independence", re.S
 )
 
+PROFILE_CSV_FIELDS = [
+    "timestamp",
+    "git_commit",
+    "build_config",
+    "iterations",
+    "stage",
+    "avg_cycles",
+    "max_cycles",
+    "log_file",
+]
+
+RE_PROFILE_HEADER = re.compile(r"Forward/backward cycle profile \((\d+) iterations")
+# Matches tests/ProfileForwardBackward.cpp's PrintStage() output:
+#   "  %-28s avg=%9.1f cycles   max=%8lu cycles"
+RE_PROFILE_STAGE = re.compile(r"^\s*(\S(?:.*\S)?)\s+avg=\s*([0-9.]+) cycles\s+max=\s*(\d+) cycles\s*$")
+
 
 @dataclass
 class BuildConfig:
     name: str
     core_value: str  # "", "0", or "1" -- passed verbatim as -DMEML_MLP_RUNS_ON_CORE=
     build_dir_name: str
+    run_mode: str = "benchmarks"  # RUN_TESTS_OR_BENCHMARKS value: "benchmarks" or "profile"
 
     @property
     def build_dir(self) -> Path:
@@ -152,6 +185,16 @@ BUILD_CONFIGS = [
     BuildConfig("core0", "0", "build-core0"),
     BuildConfig("core1", "1", "build-core1"),
     BuildConfig("naive", "", "build-naive"),
+]
+
+# Same three MEML_MLP_RUNS_ON_CORE selections, built with
+# RUN_TESTS_OR_BENCHMARKS=profile instead, in their own build directories so
+# the benchmark and profile binaries for a given config don't clobber each
+# other's CMake cache.
+PROFILE_BUILD_CONFIGS = [
+    BuildConfig("core0", "0", "build-core0-profile", run_mode="profile"),
+    BuildConfig("core1", "1", "build-core1-profile", run_mode="profile"),
+    BuildConfig("naive", "", "build-naive-profile", run_mode="profile"),
 ]
 
 
@@ -203,7 +246,7 @@ def configure(cfg: BuildConfig) -> None:
         "-B", str(cfg.build_dir),
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DRUN_TESTS_OR_BENCHMARKS=benchmarks",
+        f"-DRUN_TESTS_OR_BENCHMARKS={cfg.run_mode}",
         f"-DMEML_MLP_RUNS_ON_CORE={cfg.core_value}",
     ])
 
@@ -243,7 +286,14 @@ def wait_for_port(port: str, timeout: float) -> None:
     raise BenchmarkError(f"Serial port {port} did not reappear within {timeout:.0f}s after flashing")
 
 
-def capture_run(port: str, baudrate: int, overall_timeout_s: float, log_path: Path) -> str:
+def capture_run(
+    port: str,
+    baudrate: int,
+    overall_timeout_s: float,
+    log_path: Path,
+    start_marker: str = BENCHMARK_STARTED_MARKER,
+    end_marker: str = END_MARKER,
+) -> str:
     """Answer the firmware's prompts and capture the full UART transcript.
 
     main.cpp gates on two separate getchar_timeout_us() calls ("press any
@@ -308,13 +358,13 @@ def capture_run(port: str, baudrate: int, overall_timeout_s: float, log_path: Pa
                 log_f.flush()
                 lines.append(line)
 
-                if not gates_cleared and BENCHMARK_STARTED_MARKER in line:
+                if not gates_cleared and start_marker in line:
                     gates_cleared = True
-                elif END_MARKER in line:
+                elif end_marker in line:
                     return "\n".join(lines)
     finally:
         ser.close()
-    raise BenchmarkError(f"Timed out after {overall_timeout_s:.0f}s waiting for '{END_MARKER}'")
+    raise BenchmarkError(f"Timed out after {overall_timeout_s:.0f}s waiting for '{end_marker}'")
 
 
 def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
@@ -410,6 +460,45 @@ def append_rows_to_csv(rows: list) -> None:
             writer.writerow(row)
 
 
+def parse_profile_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    header_match = RE_PROFILE_HEADER.search(text)
+    if not header_match:
+        raise BenchmarkError("Could not locate 'Forward/backward cycle profile (...)' header in UART transcript")
+    iterations = header_match.group(1)
+
+    rows = []
+    for line in text.splitlines():
+        stage_match = RE_PROFILE_STAGE.match(line)
+        if not stage_match:
+            continue
+        stage, avg_cycles, max_cycles = stage_match.groups()
+        rows.append(dict(
+            timestamp=timestamp,
+            git_commit=git_commit,
+            build_config=build_config,
+            iterations=iterations,
+            stage=stage,
+            avg_cycles=avg_cycles,
+            max_cycles=max_cycles,
+            log_file=log_file,
+        ))
+
+    if not rows:
+        raise BenchmarkError("Could not locate any per-stage 'avg=... max=...' lines in UART transcript")
+    return rows
+
+
+def append_profile_rows_to_csv(rows: list) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    csv_is_new = not PROFILE_CSV_PATH.exists()
+    with open(PROFILE_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
+        writer = csv.DictWriter(csv_f, fieldnames=PROFILE_CSV_FIELDS)
+        if csv_is_new:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 SAMPLE_TRANSCRIPT_PINNED = """\
 Press any key to continue...
 Press any key to start benchmarks...
@@ -442,6 +531,28 @@ SAMPLE_TRANSCRIPT_NAIVE = SAMPLE_TRANSCRIPT_PINNED.replace(
     "avg_diff=12.30%, max_diff=18.20%, tolerance=1%",
 )
 
+SAMPLE_PROFILE_TRANSCRIPT = """\
+Press any key to continue...
+Press any key to start profiling...
+
+Forward/backward cycle profile (100 iterations, network 64-64-32-10):
+Forward:
+  layer0.forward               avg=   1234.5 cycles   max=    1300 cycles
+  layer1.forward               avg=    567.8 cycles   max=     600 cycles
+  layer2.forward               avg=    123.4 cycles   max=     150 cycles
+  forward total                avg=   1925.7 cycles   max=    2050 cycles
+Loss:
+  compute_loss                 avg=     45.6 cycles   max=      60 cycles
+Backward:
+  layer2.AccumulateGradients   avg=    234.5 cycles   max=     260 cycles
+  layer1.AccumulateGradients   avg=    678.9 cycles   max=     700 cycles
+  layer0.AccumulateGradients   avg=   1345.6 cycles   max=    1400 cycles
+  backward total               avg=   2259.0 cycles   max=    2360 cycles
+Full forward+loss+backward total:
+  full pass                    avg=   4230.3 cycles   max=    4470 cycles
+
+"""
+
 
 def run_self_test() -> None:
     pinned_rows = parse_transcript(SAMPLE_TRANSCRIPT_PINNED, "core0", "20260101_000000", "deadbeef", "sample.log")
@@ -464,7 +575,18 @@ def run_self_test() -> None:
     assert naive_rows[0]["timing_verdict"] == "EXPECTED-DEVIATION"
     assert naive_rows[0]["timing_avg_diff_pct"] == "12.30"
 
-    log("Self-test OK: parser correctly extracts both pinned and naive transcripts.")
+    profile_rows = parse_profile_transcript(
+        SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
+    )
+    assert len(profile_rows) == 10
+    assert profile_rows[0]["stage"] == "layer0.forward"
+    assert profile_rows[0]["avg_cycles"] == "1234.5"
+    assert profile_rows[0]["max_cycles"] == "1300"
+    assert profile_rows[0]["iterations"] == "100"
+    assert profile_rows[-1]["stage"] == "full pass"
+    assert profile_rows[-1]["max_cycles"] == "4470"
+
+    log("Self-test OK: parser correctly extracts pinned, naive, and profile transcripts.")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -479,16 +601,30 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--picotool", default=str(DEFAULT_PICOTOOL), help="Path to picotool if not on PATH")
     parser.add_argument(
         "--timeout", type=float, default=DEFAULT_RUN_TIMEOUT_S,
-        help="Max seconds to wait for one flashed run to print 'Test completed.'",
+        help="Max seconds to wait for one flashed benchmark run to print 'Test completed.'",
+    )
+    parser.add_argument(
+        "--profile-timeout", type=float, default=DEFAULT_PROFILE_TIMEOUT_S,
+        help="Max seconds to wait for one flashed profile run to print its 'full pass' stats line",
+    )
+    parser.add_argument(
+        "--skip-profile", action="store_true",
+        help="Skip the RUN_TESTS_OR_BENCHMARKS=profile build/flash/run entirely, for each selected config",
+    )
+    parser.add_argument(
+        "--skip-benchmark", action="store_true",
+        help="Skip the RUN_TESTS_OR_BENCHMARKS=benchmarks build/flash/run entirely, for each selected "
+             "config (useful since the benchmark run takes ~15 min/config vs. seconds for the profile run)",
     )
     parser.add_argument(
         "--skip-build", action="store_true",
-        help="Reuse each configuration's existing build directory instead of reconfiguring+rebuilding",
+        help="Reuse each configuration's existing build directory (benchmark and profile alike) "
+             "instead of reconfiguring+rebuilding",
     )
     parser.add_argument(
         "--skip-flash", action="store_true",
         help="Skip picotool flashing (assume the board is already running the right firmware); "
-             "only meaningful with a single --configs entry",
+             "only meaningful with a single --configs entry and one of --skip-profile/--skip-benchmark",
     )
     parser.add_argument(
         "--self-test", action="store_true",
@@ -503,6 +639,9 @@ def main(argv=None) -> int:
     if args.self_test:
         run_self_test()
         return 0
+
+    if args.skip_benchmark and args.skip_profile:
+        sys.exit("--skip-benchmark and --skip-profile together would skip everything; drop one")
 
     if serial is None:
         sys.exit(
@@ -524,31 +663,70 @@ def main(argv=None) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     configs_by_name = {c.name: c for c in BUILD_CONFIGS}
+    profile_configs_by_name = {c.name: c for c in PROFILE_BUILD_CONFIGS}
     for name in args.configs:
-        cfg = configs_by_name[name]
-        log(f"\n=== {cfg.name} (MEML_MLP_RUNS_ON_CORE={cfg.core_value!r}) ===")
+        if not args.skip_benchmark:
+            cfg = configs_by_name[name]
+            log(f"\n=== {cfg.name} (MEML_MLP_RUNS_ON_CORE={cfg.core_value!r}) ===")
+
+            if not args.skip_build:
+                configure(cfg)
+                build(cfg)
+
+            if not cfg.elf_path.exists():
+                sys.exit(f"Expected built ELF not found: {cfg.elf_path}")
+
+            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = LOG_DIR / f"{cfg.name}_{timestamp}.log"
+
+            if not args.skip_flash:
+                flash(picotool, cfg.elf_path)
+
+            log(f"Waiting for board on {args.serial_port} (timeout {args.timeout:.0f}s)...")
+            transcript = capture_run(args.serial_port, args.baudrate, args.timeout, log_path)
+
+            rows = parse_transcript(transcript, cfg.name, timestamp, git_commit, str(log_path.relative_to(REPO_ROOT)))
+            append_rows_to_csv(rows)
+            log(f"Saved {len(rows)} row(s) for {cfg.name} to {CSV_PATH}; raw log at {log_path}")
+
+        if args.skip_profile:
+            continue
+
+        profile_cfg = profile_configs_by_name[name]
+        log(f"\n=== {profile_cfg.name} profile (MEML_MLP_RUNS_ON_CORE={profile_cfg.core_value!r}) ===")
 
         if not args.skip_build:
-            configure(cfg)
-            build(cfg)
+            configure(profile_cfg)
+            build(profile_cfg)
 
-        if not cfg.elf_path.exists():
-            sys.exit(f"Expected built ELF not found: {cfg.elf_path}")
+        if not profile_cfg.elf_path.exists():
+            sys.exit(f"Expected built ELF not found: {profile_cfg.elf_path}")
 
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = LOG_DIR / f"{cfg.name}_{timestamp}.log"
+        profile_timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        profile_log_path = LOG_DIR / f"{profile_cfg.name}_profile_{profile_timestamp}.log"
 
         if not args.skip_flash:
-            flash(picotool, cfg.elf_path)
+            flash(picotool, profile_cfg.elf_path)
 
-        log(f"Waiting for board on {args.serial_port} (timeout {args.timeout:.0f}s)...")
-        transcript = capture_run(args.serial_port, args.baudrate, args.timeout, log_path)
+        log(f"Waiting for board on {args.serial_port} (timeout {args.profile_timeout:.0f}s)...")
+        profile_transcript = capture_run(
+            args.serial_port, args.baudrate, args.profile_timeout, profile_log_path,
+            start_marker=PROFILE_STARTED_MARKER, end_marker=PROFILE_END_MARKER,
+        )
 
-        rows = parse_transcript(transcript, cfg.name, timestamp, git_commit, str(log_path.relative_to(REPO_ROOT)))
-        append_rows_to_csv(rows)
-        log(f"Saved {len(rows)} row(s) for {cfg.name} to {CSV_PATH}; raw log at {log_path}")
+        profile_rows = parse_profile_transcript(
+            profile_transcript, profile_cfg.name, profile_timestamp, git_commit,
+            str(profile_log_path.relative_to(REPO_ROOT)),
+        )
+        append_profile_rows_to_csv(profile_rows)
+        log(f"Saved {len(profile_rows)} row(s) for {profile_cfg.name} to {PROFILE_CSV_PATH}; raw log at {profile_log_path}")
 
-    log(f"\nAll done. Results in {CSV_PATH}")
+    result_paths = []
+    if not args.skip_benchmark:
+        result_paths.append(str(CSV_PATH))
+    if not args.skip_profile:
+        result_paths.append(str(PROFILE_CSV_PATH))
+    log(f"\nAll done. Results in {' and '.join(result_paths)}")
     return 0
 
 
