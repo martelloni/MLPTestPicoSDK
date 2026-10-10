@@ -229,6 +229,9 @@ def check_mlp_entry_points(symbols, core, errors, mode, facade="MLPOpticalRecogn
             (addr, name) for addr, name in symbols
             if name.startswith(f"_ZN{len(facade)}{facade}") and method in name
             and not _is_ctor_or_dtor(name)
+            # Nested helper classes (the baseline's private Engine subclass of the
+            # untagged old MLP) are not facade entry points and cannot be tagged.
+            and f"{len(facade)}{facade}{len('Engine')}Engine" not in name
         ]
         if not matches:
             fail(errors, f"{facade}::{method} entry point not found in the ELF")
