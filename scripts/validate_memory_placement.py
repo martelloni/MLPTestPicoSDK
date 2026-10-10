@@ -191,7 +191,27 @@ def check_mlp_symbol_placement(symbols, core, errors):
             )
 
 
-def check_mlp_entry_points(symbols, core, errors, mode):
+# Old-engine (mlp/MLP.h) weights, RMSProp and gradient-accumulator buffers are
+# std::vector heap allocations (~82 KB for the 64-64-32-10 net); a build that
+# leaves less than this between the end of static RAM and the heap limit would
+# only fail at runtime with a failed allocation. Keep in sync with CMakeLists.txt.
+MIN_BASELINE_HEAP_BYTES = 90112
+
+
+def check_baseline_heap_headroom(symbols, errors):
+    by_name = {name: addr for addr, name in symbols}
+    limit = by_name.get("__HeapLimit")
+    end = by_name.get("__end__", by_name.get("end"))
+    if limit is None or end is None:
+        fail(errors, "__HeapLimit/__end__ not found; cannot verify the baseline engine's heap headroom")
+        return
+    headroom = limit - end
+    if headroom < MIN_BASELINE_HEAP_BYTES:
+        fail(errors, f"baseline engine heap headroom {headroom} bytes ({end:#x}..{limit:#x}) is below "
+                     f"the {MIN_BASELINE_HEAP_BYTES} bytes its std::vector state needs -- shrink the RAM flooder")
+
+
+def check_mlp_entry_points(symbols, core, errors, mode, facade="MLPOpticalRecognition"):
     """Now that the hot-path helpers are expected to inline away, most of
     namespace smlp may leave no standalone symbol at all in an optimized
     build -- so the old "did the build actually link mlp/?" sanity check
@@ -207,17 +227,17 @@ def check_mlp_entry_points(symbols, core, errors, mode):
     for method in required_methods:
         matches = [
             (addr, name) for addr, name in symbols
-            if name.startswith("_ZN21MLPOpticalRecognition") and method in name
+            if name.startswith(f"_ZN{len(facade)}{facade}") and method in name
             and not _is_ctor_or_dtor(name)
         ]
         if not matches:
-            fail(errors, f"MLPOpticalRecognition::{method} entry point not found in the ELF")
+            fail(errors, f"{facade}::{method} entry point not found in the ELF")
             continue
         for addr, name in matches:
             if not (expected_lo <= addr < expected_hi):
                 fail(
                     errors,
-                    f"MLPOpticalRecognition entry point '{name}' at {addr:#x} is outside "
+                    f"{facade} entry point '{name}' at {addr:#x} is outside "
                     f"the selected core's bank [{expected_lo:#x}, {expected_hi:#x})",
                 )
 
@@ -332,6 +352,13 @@ def main():
              "'profile' is only meaningful with --core '' (no per-bank placement scheme to "
              "check at all -- see check_scheme_absent).",
     )
+    parser.add_argument(
+        "--engine", default="static", choices=("static", "baseline"),
+        help="MEML_MLP_ENGINE value. 'baseline' (old heap-based mlp/MLP.h) has no smlp "
+             "symbols and its weights live on the heap, so only the facade entry points, "
+             "the pinned mlp_experiment_/ram_flooder_ objects and the bank bounds are "
+             "checked; the smlp prefix/inlining-canary checks are skipped.",
+    )
     args = parser.parse_args()
 
     sections = parse_sections(run(args.readelf, ["-SW", args.elf]))
@@ -343,6 +370,8 @@ def main():
         # there is nothing left to check except that the scheme was genuinely
         # skipped, not just that nothing happened to land in it.
         check_scheme_absent(sections, errors)
+        if args.engine == "baseline":
+            check_baseline_heap_headroom(symbols, errors)
     elif args.mode == "profile":
         # ProfileForwardBackward.cpp only names MLPOpticalRecognition::Net (a
         # type alias) and never instantiates the MLPOpticalRecognition class,
@@ -360,13 +389,18 @@ def main():
         for name in CORE1_SECTIONS:
             check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
         check_flash_outside_ram(sections, errors)
-        check_mlp_symbol_placement(symbols, args.core, errors)
-        check_mlp_entry_points(symbols, args.core, errors, args.mode)
+        if args.engine == "baseline":
+            check_mlp_entry_points(symbols, args.core, errors, args.mode, "MLPOpticalRecognitionBaseline")
+            check_baseline_heap_headroom(symbols, errors)
+        else:
+            check_mlp_symbol_placement(symbols, args.core, errors)
+            check_mlp_entry_points(symbols, args.core, errors, args.mode)
         if args.mode == "tests":
             check_placement_probe(symbols, args.core, errors)
         else:
             check_benchmark_placement(symbols, args.core, errors)
-            check_mlp_inlining_canary(symbols, errors)
+            if args.engine == "static":
+                check_mlp_inlining_canary(symbols, errors)
 
     if errors:
         print(f"validate_memory_placement: FAIL ({len(errors)} issue(s)) "

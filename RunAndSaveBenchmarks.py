@@ -33,6 +33,8 @@ Usage:
     source .venv/bin/activate
     python RunAndSaveBenchmarks.py                     # all 3 configs
     python RunAndSaveBenchmarks.py --configs core0      # just one
+    python RunAndSaveBenchmarks.py --engine baseline    # old mlp/MLP.h engine (benchmark only)
+    python RunAndSaveBenchmarks.py --engine both        # static + baseline configs
     python RunAndSaveBenchmarks.py --self-test          # parser smoke test, no hardware
 
 See --help for the rest of the flags (serial port, picotool path, timeouts).
@@ -171,6 +173,7 @@ class BuildConfig:
     core_value: str  # "", "0", or "1" -- passed verbatim as -DMEML_MLP_RUNS_ON_CORE=
     build_dir_name: str
     run_mode: str = "benchmarks"  # RUN_TESTS_OR_BENCHMARKS value: "benchmarks" or "profile"
+    engine: str = "static"  # MEML_MLP_ENGINE value: "static" (smlp::StaticMLP) or "baseline" (old mlp/MLP.h)
 
     @property
     def build_dir(self) -> Path:
@@ -185,6 +188,16 @@ BUILD_CONFIGS = [
     BuildConfig("core0", "0", "build-core0"),
     BuildConfig("core1", "1", "build-core1"),
     BuildConfig("naive", "", "build-naive"),
+]
+
+# Same placements, but running the experiment on the old heap-based mlp/MLP.h
+# engine (MEML_MLP_ENGINE=baseline) via MLPOpticalRecognitionBaseline. Benchmark
+# only: the DWT profiler is written against the static engine's layer types, so
+# these have no profile counterpart. Opt in with --engine baseline|both.
+BASELINE_BUILD_CONFIGS = [
+    BuildConfig("core0-baseline", "0", "build-core0-baseline", engine="baseline"),
+    BuildConfig("core1-baseline", "1", "build-core1-baseline", engine="baseline"),
+    BuildConfig("naive-baseline", "", "build-naive-baseline", engine="baseline"),
 ]
 
 # Same three MEML_MLP_RUNS_ON_CORE selections, built with
@@ -248,6 +261,7 @@ def configure(cfg: BuildConfig) -> None:
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DRUN_TESTS_OR_BENCHMARKS={cfg.run_mode}",
         f"-DMEML_MLP_RUNS_ON_CORE={cfg.core_value}",
+        f"-DMEML_MLP_ENGINE={cfg.engine}",
     ])
 
 
@@ -592,9 +606,15 @@ def run_self_test() -> None:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--configs", nargs="+", choices=[c.name for c in BUILD_CONFIGS],
-        default=[c.name for c in BUILD_CONFIGS],
-        help="Which build configurations to run (default: all three)",
+        "--configs", nargs="+", choices=[c.name for c in BUILD_CONFIGS + BASELINE_BUILD_CONFIGS],
+        default=None,
+        help="Which build configurations to run (default: the three configs of the --engine selection)",
+    )
+    parser.add_argument(
+        "--engine", choices=("static", "baseline", "both"), default="static",
+        help="Which MLP engine's configs to run when --configs is not given: 'static' "
+             "(smlp::StaticMLP, default), 'baseline' (old mlp/MLP.h, benchmark only -- no profile "
+             "run), or 'both'",
     )
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT, help="Serial device for the board's USB CDC UART")
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
@@ -635,6 +655,11 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.configs is None:
+        args.configs = (
+            ([c.name for c in BUILD_CONFIGS] if args.engine in ("static", "both") else [])
+            + ([c.name for c in BASELINE_BUILD_CONFIGS] if args.engine in ("baseline", "both") else [])
+        )
 
     if args.self_test:
         run_self_test()
@@ -662,7 +687,7 @@ def main(argv=None) -> int:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    configs_by_name = {c.name: c for c in BUILD_CONFIGS}
+    configs_by_name = {c.name: c for c in BUILD_CONFIGS + BASELINE_BUILD_CONFIGS}
     profile_configs_by_name = {c.name: c for c in PROFILE_BUILD_CONFIGS}
     for name in args.configs:
         if not args.skip_benchmark:
@@ -690,6 +715,9 @@ def main(argv=None) -> int:
             log(f"Saved {len(rows)} row(s) for {cfg.name} to {CSV_PATH}; raw log at {log_path}")
 
         if args.skip_profile:
+            continue
+        if name not in profile_configs_by_name:
+            log(f"{name}: no profile build for the baseline engine; skipping profile step")
             continue
 
         profile_cfg = profile_configs_by_name[name]

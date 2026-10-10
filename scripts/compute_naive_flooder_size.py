@@ -61,6 +61,11 @@ def main():
     parser.add_argument("--readelf", default="arm-none-eabi-readelf")
     parser.add_argument("--output", required=True, help="Path to write the generated header")
     parser.add_argument("--margin-bytes", type=int, default=DEFAULT_MARGIN_BYTES)
+    parser.add_argument(
+        "--reserve-bytes", type=int, default=0,
+        help="Extra bytes to leave free for runtime heap (the baseline engine's std::vector "
+             "weights/buffers; the static engine needs none).",
+    )
     args = parser.parse_args()
 
     sections = parse_alloc_sections(run(args.readelf, ["-SW", args.elf]))
@@ -72,14 +77,14 @@ def main():
         size for _name, addr, size in sections if RAM0_BASE <= addr < RAM0_END
     )
 
-    budget_bytes = RAM_BUDGET_BYTES - probe_footprint_bytes - args.margin_bytes
+    budget_bytes = RAM_BUDGET_BYTES - probe_footprint_bytes - args.margin_bytes - args.reserve_bytes
 
     if budget_bytes < MIN_USEFUL_FLOOD_BYTES:
         print(
             f"compute_naive_flooder_size: FAIL -- remaining budget {budget_bytes} bytes "
             f"is below the minimum useful flood size {MIN_USEFUL_FLOOD_BYTES} bytes "
             f"(probe footprint={probe_footprint_bytes}, window={RAM_BUDGET_BYTES}, "
-            f"margin={args.margin_bytes})",
+            f"margin={args.margin_bytes}, heap reserve={args.reserve_bytes})",
             file=sys.stderr,
         )
         return 1

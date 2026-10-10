@@ -49,6 +49,21 @@ if(NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "tests" AND NOT RUN_TESTS_OR_BENCHMARKS 
     message(FATAL_ERROR "RUN_TESTS_OR_BENCHMARKS must be 'tests', 'benchmarks', or 'profile'.")
 endif()
 
+# Build-time (never runtime) engine selector for the benchmarks build:
+#   static   -- MLPOpticalRecognition on smlp::StaticMLP (default; the
+#               pre-existing code path, compiled exactly as before)
+#   baseline -- MLPOpticalRecognitionBaseline on the old heap-based mlp/MLP.h
+# Only meaningful for RUN_TESTS_OR_BENCHMARKS=benchmarks: the unit-test suite
+# and the DWT profiler are written against the static engine's types.
+set(MEML_MLP_ENGINE "static" CACHE STRING "MLP engine for the benchmark build: 'static' (smlp::StaticMLP) or 'baseline' (old mlp/MLP.h)")
+set_property(CACHE MEML_MLP_ENGINE PROPERTY STRINGS static baseline)
+if(NOT MEML_MLP_ENGINE STREQUAL "static" AND NOT MEML_MLP_ENGINE STREQUAL "baseline")
+    message(FATAL_ERROR "MEML_MLP_ENGINE must be 'static' or 'baseline'.")
+endif()
+if(MEML_MLP_ENGINE STREQUAL "baseline" AND NOT RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks")
+    message(FATAL_ERROR "MEML_MLP_ENGINE=baseline is only supported with RUN_TESTS_OR_BENCHMARKS=benchmarks.")
+endif()
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
@@ -94,9 +109,17 @@ else()
     # dataset/experiment translation units the tests build does. Both
     # benchmark headers are header-only and included directly by main.cpp, so
     # no separate source file is added for either.
-    list(APPEND MLPTestPicoSDK_SOURCES
-        dataset/Dataset.cpp
-        experiments/MLPOpticalRecognition.cpp)
+    if(MEML_MLP_ENGINE STREQUAL "baseline")
+        list(APPEND MLPTestPicoSDK_SOURCES
+            dataset/Dataset.cpp
+            experiments/MLPOpticalRecognitionBaseline.cpp
+            mlp/MLP.cpp
+            mlp/Utils.cpp)
+    else()
+        list(APPEND MLPTestPicoSDK_SOURCES
+            dataset/Dataset.cpp
+            experiments/MLPOpticalRecognition.cpp)
+    endif()
 endif()
 
 add_executable(MLPTestPicoSDK ${MLPTestPicoSDK_SOURCES})
@@ -114,6 +137,9 @@ elseif(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
     target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_RUN_PROFILE)
 else()
     target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK)
+    if(MEML_MLP_ENGINE STREQUAL "baseline")
+        target_compile_definitions(MLPTestPicoSDK PRIVATE MEML_MLP_ENGINE_BASELINE)
+    endif()
 endif()
 
 # Keep the SDK-generated linker script and inject only the custom per-core SRAM sections.
@@ -204,10 +230,14 @@ pico_add_extra_outputs(MLPTestPicoSDK)
 # throwaway probe with a nominal 1-word flooder measures "everything else",
 # then a script computes the real flooder size from the probe's own ELF.
 if(MEML_MLP_RUNS_ON_CORE STREQUAL "" AND RUN_TESTS_OR_BENCHMARKS STREQUAL "benchmarks")
-    add_executable(MLPTestPicoSDK_naive_flooder_probe
-            main.cpp
-            dataset/Dataset.cpp
-            experiments/MLPOpticalRecognition.cpp)
+    add_executable(MLPTestPicoSDK_naive_flooder_probe main.cpp dataset/Dataset.cpp)
+    if(MEML_MLP_ENGINE STREQUAL "baseline")
+        target_sources(MLPTestPicoSDK_naive_flooder_probe PRIVATE
+                experiments/MLPOpticalRecognitionBaseline.cpp mlp/MLP.cpp mlp/Utils.cpp)
+        target_compile_definitions(MLPTestPicoSDK_naive_flooder_probe PRIVATE MEML_MLP_ENGINE_BASELINE)
+    else()
+        target_sources(MLPTestPicoSDK_naive_flooder_probe PRIVATE experiments/MLPOpticalRecognition.cpp)
+    endif()
     target_compile_definitions(MLPTestPicoSDK_naive_flooder_probe PRIVATE
             MEML_ENABLE_RAM_INDEPENDENCE_BENCHMARK
             MEML_NAIVE_FLOODER_PROBE_BUILD)
@@ -224,6 +254,12 @@ if(MEML_MLP_RUNS_ON_CORE STREQUAL "" AND RUN_TESTS_OR_BENCHMARKS STREQUAL "bench
     pico_enable_stdio_usb(MLPTestPicoSDK_naive_flooder_probe 1)
     pico_add_extra_outputs(MLPTestPicoSDK_naive_flooder_probe)
 
+    set(MEML_NAIVE_FLOODER_HEAP_RESERVE_ARGS "")
+    if(MEML_MLP_ENGINE STREQUAL "baseline")
+        # The old engine's weights live on the heap (see
+        # validate_memory_placement.py's MIN_BASELINE_HEAP_BYTES, same value).
+        set(MEML_NAIVE_FLOODER_HEAP_RESERVE_ARGS --reserve-bytes 90112)
+    endif()
     set(MEML_NAIVE_FLOODER_SIZE_HEADER ${CMAKE_BINARY_DIR}/generated/NaiveFlooderSize.hpp)
     add_custom_command(
             OUTPUT ${MEML_NAIVE_FLOODER_SIZE_HEADER}
@@ -232,6 +268,7 @@ if(MEML_MLP_RUNS_ON_CORE STREQUAL "" AND RUN_TESTS_OR_BENCHMARKS STREQUAL "bench
                     $<TARGET_FILE:MLPTestPicoSDK_naive_flooder_probe>
                     --readelf ${CMAKE_READELF}
                     --output ${MEML_NAIVE_FLOODER_SIZE_HEADER}
+                    ${MEML_NAIVE_FLOODER_HEAP_RESERVE_ARGS}
             DEPENDS MLPTestPicoSDK_naive_flooder_probe
             COMMENT "Computing naive-layout RAM flooder size from probe build"
             VERBATIM)
@@ -251,5 +288,6 @@ add_custom_command(TARGET MLPTestPicoSDK POST_BUILD
                 --readelf ${CMAKE_READELF}
                 --nm ${CMAKE_NM}
                 --mode ${RUN_TESTS_OR_BENCHMARKS}
+                --engine ${MEML_MLP_ENGINE}
         COMMENT "Validating core-0/core-1 memory placement"
         VERBATIM)

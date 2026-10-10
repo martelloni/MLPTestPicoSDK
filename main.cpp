@@ -100,7 +100,7 @@ int main()
     // read. Snapshot each run's data into locals immediately after RunTest()
     // returns, before constructing the next run.
     struct RunSnapshot {
-        std::array<MLPOpticalRecognition::Result, BenchmarkTest::kMaxTrainingRepeats> results;
+        std::array<MLPExperiment::Result, BenchmarkTest::kMaxTrainingRepeats> results;
         uint32_t result_count;
         test::TestBase::TestResultsPerCore mlp_timing;
         test::TestBase::TestResultsPerCore other_timing;

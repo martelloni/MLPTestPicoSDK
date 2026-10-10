@@ -30,7 +30,7 @@
 
 #include "TestBase.hpp"
 #include "MemoryDefs.hpp"
-#include "experiments/MLPOpticalRecognition.hpp"
+#include "experiments/MLPExperiment.hpp"
 
 // Sizing the flood buffer to fill whatever the shared 256 KiB window has
 // left after every other static object in the program (Step 7's two-pass
@@ -90,7 +90,7 @@ public:
     }
 
     /// {loss, accuracy} for each completed training session, in order.
-    const std::array<MLPOpticalRecognition::Result, kMaxTrainingRepeats> & GetTrainingResults() const {
+    const std::array<MLPExperiment::Result, kMaxTrainingRepeats> & GetTrainingResults() const {
         return training_results_;
     }
     uint32_t GetTrainingResultCount() const { return result_count_; }
@@ -139,7 +139,7 @@ private:
     // order puts them inside the shared 256 KiB window. This is the entire
     // point of the counterfactual: Step 1's placement scheme is switched off
     // completely here, not just for this one instance.
-    inline static MLPOpticalRecognition mlp_experiment_{};
+    inline static MLPExperiment mlp_experiment_{};
     inline static utils::RAMFlooder<uint32_t, kNaiveFlooderWords> ram_flooder_{};
 
     // Plain (untagged) completion signal: not smlp:: state, must stay outside
@@ -155,7 +155,7 @@ private:
     inline static bool run_other_core_task_{true};
     inline static uint32_t other_core_iteration_cap_{0u};
 
-    inline static std::array<MLPOpticalRecognition::Result, kMaxTrainingRepeats> training_results_{};
+    inline static std::array<MLPExperiment::Result, kMaxTrainingRepeats> training_results_{};
     inline static uint32_t result_count_{0u};
 
     inline static uint64_t flood_iteration_counter_{0u};
@@ -180,7 +180,7 @@ private:
         mlp_experiment_.Initialise(seed);
 
         StartMeasurementCore0();
-        const MLPOpticalRecognition::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
+        const MLPExperiment::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
         StopMeasurementCore0();
 
         // Record this session's result; the array is fixed-size, so extra sessions

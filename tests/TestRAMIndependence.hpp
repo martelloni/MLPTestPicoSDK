@@ -27,7 +27,7 @@
 
 #include "TestBase.hpp"
 #include "MemoryDefs.hpp"
-#include "experiments/MLPOpticalRecognition.hpp"
+#include "experiments/MLPExperiment.hpp"
 
 // The RAM flooder must always live on whichever core the MLP experiment did
 // NOT get pinned to, driven by the same selector rather than independently
@@ -88,7 +88,7 @@ public:
     }
 
     /// {loss, accuracy} for each completed training session, in order.
-    const std::array<MLPOpticalRecognition::Result, kMaxTrainingRepeats> & GetTrainingResults() const {
+    const std::array<MLPExperiment::Result, kMaxTrainingRepeats> & GetTrainingResults() const {
         return training_results_;
     }
     uint32_t GetTrainingResultCount() const { return result_count_; }
@@ -145,7 +145,7 @@ private:
     // One build-owned experiment instance, pinned to whichever core the selector
     // chose; separate from the unit-test suite's g_experiment (tests/benchmarks
     // are mutually exclusive build modes, so the two never coexist in one binary).
-    inline static MEML_MLP_DATA MLPOpticalRecognition mlp_experiment_{};
+    inline static MEML_MLP_DATA MLPExperiment mlp_experiment_{};
 
     // The flooder's other core is the otherwise near-empty core-1 bank when the
     // MLP runs on core 0, so it can claim the full 240 KB. When the MLP instead
@@ -155,6 +155,14 @@ private:
     // window rather than claim all of it, so its size is deliberately smaller here.
 #if MEML_MLP_RUNS_ON_CORE == 0
     static constexpr uint32_t core_ram_flooder_size_ = 1024 * 60; // 240 KB, on core 1
+#elif defined(MEML_MLP_ENGINE_BASELINE)
+    // The baseline (old mlp/MLP.h) engine keeps ~82 KB of weights/gradient/RMSProp
+    // buffers on the heap, which lives in core 0's bank, and its larger
+    // libstdc++-heavy code image also sits there. Shrink the core-0 flooder so the
+    // heap still fits (validate_memory_placement.py --engine baseline enforces the
+    // headroom at link time). Flood *pattern* and bandwidth pressure are unchanged;
+    // only the swept footprint differs from the static-engine run.
+    static constexpr uint32_t core_ram_flooder_size_ = 1024 * 12; // 48 KB, on core 0
 #else
     static constexpr uint32_t core_ram_flooder_size_ = 1024 * 24; // 96 KB, on core 0
 #endif
@@ -172,7 +180,7 @@ private:
     inline static bool run_other_core_task_{true};
     inline static uint32_t other_core_iteration_cap_{0u};
 
-    inline static std::array<MLPOpticalRecognition::Result, kMaxTrainingRepeats> training_results_{};
+    inline static std::array<MLPExperiment::Result, kMaxTrainingRepeats> training_results_{};
     inline static uint32_t result_count_{0u};
 
     inline static uint64_t flood_iteration_counter_{0u};
@@ -198,11 +206,11 @@ private:
 
 #if MEML_MLP_RUNS_ON_CORE == 0
         StartMeasurementCore0();
-        const MLPOpticalRecognition::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
+        const MLPExperiment::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
         StopMeasurementCore0();
 #else
         StartMeasurementCore1();
-        const MLPOpticalRecognition::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
+        const MLPExperiment::Result result = mlp_experiment_.Train(epochs_per_session_, kLearningRate);
         StopMeasurementCore1();
 #endif
 
