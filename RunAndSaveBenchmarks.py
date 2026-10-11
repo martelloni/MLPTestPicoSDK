@@ -25,9 +25,17 @@ For each configuration this script:
      transcript to benchmark_results/logs/, and appends one CSV row per
      profiled stage to benchmark_results/profiling_results.csv.
 
-Per-session (per training-repeat) loss/accuracy is intentionally NOT
-extracted -- only the run-level metrics main.cpp prints (MLP core timing,
-other-core flood/dormant stats, correctness/timing-independence verdicts).
+Each condition's per-session (per training-repeat) loss and accuracy are
+recorded verbatim (session_losses / session_accuracies, ';'-joined) as the
+"golden numerics" of that commit: sessions use fixed seeds, so a change that
+claims to be bit-exact must reproduce them exactly (plan-mlpBetterOptimisation.md
+Step 0). Run-level metrics main.cpp prints (MLP core timing, other-core
+flood/dormant stats, correctness/timing-independence verdicts) are kept too.
+
+Profile runs additionally record the placement (address and address % 16) of
+every hot kernel and of each layer's weight/gradient/input buffers in
+benchmark_results/placement_results.csv, so cycle counts can be correlated
+with SRAM bank phase.
 
 Usage:
     source .venv/bin/activate
@@ -73,6 +81,7 @@ RESULTS_DIR = REPO_ROOT / "benchmark_results"
 LOG_DIR = RESULTS_DIR / "logs"
 CSV_PATH = RESULTS_DIR / "ram_independence_results.csv"
 PROFILE_CSV_PATH = RESULTS_DIR / "profiling_results.csv"
+PLACEMENT_CSV_PATH = RESULTS_DIR / "placement_results.csv"
 
 # Mirrors main.cpp's kEpochsPerSession, which is not itself printed over UART.
 EXPECTED_EPOCHS_PER_SESSION = 10
@@ -84,10 +93,11 @@ END_MARKER = "Test completed."
 # "Forward/backward cycle profile (...)" report and then sit forever in a
 # bare tight_loop_contents() with no further output and no "Test completed."
 # line -- so the report's own header doubles as the gate-cleared marker, and
-# the last stat line it prints ("full pass", from PrintStage(full_total))
-# doubles as the end-of-transcript marker.
+# its closing line doubles as the end-of-transcript marker.
 PROFILE_STARTED_MARKER = "Forward/backward cycle profile"
-PROFILE_END_MARKER = "full pass"
+# Printed last by RunForwardBackwardProfile(), after the per-batch stage and
+# placement blocks that follow the "full pass" stat line.
+PROFILE_END_MARKER = "Profile complete."
 
 # Bold cyan for this script's own status messages, so they stand out from
 # passed-through cmake/ninja/picotool output and raw UART lines, which are
@@ -122,6 +132,8 @@ CSV_FIELDS = [
     "other_core_iterations",
     "other_core_iteration_cap",
     "correctness_identical",
+    "session_losses",
+    "session_accuracies",
     "timing_avg_diff_pct",
     "timing_max_diff_pct",
     "timing_tolerance_pct",
@@ -131,6 +143,7 @@ CSV_FIELDS = [
 
 RE_CLOCK = re.compile(r"Running RAM independence test with clock frequency:\s*(\d+)\s*MHz")
 RE_SESSION = re.compile(r"session \d+: loss=")
+RE_SESSION_VALUES = re.compile(r"session \d+: loss=(\S+) accuracy=(\S+)")
 RE_MLP = re.compile(r"MLP core: avg_time=([0-9.]+) us, max_time=([0-9.]+) us")
 RE_FLOOD_ITERS = re.compile(r"other core: flood iterations consumed until done=([0-9.eE+-]+)")
 RE_FLOOD_FILL = re.compile(r"other core: fill_time avg=([0-9.]+) us, max=([0-9.]+) us")
@@ -434,9 +447,17 @@ def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: s
         log_file=log_file,
     )
 
+    def session_values(block: str) -> dict:
+        found = RE_SESSION_VALUES.findall(block)
+        return dict(
+            session_losses=";".join(loss for loss, _ in found),
+            session_accuracies=";".join(acc for _, acc in found),
+        )
+
     flood_row = dict(common)
     flood_row.update(
         condition="flooding",
+        **session_values(flood_text),
         training_repeats=len(RE_SESSION.findall(flood_text)),
         mlp_avg_time_us=flood_avg,
         mlp_max_time_us=flood_max,
@@ -450,6 +471,7 @@ def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: s
     dormant_row = dict(common)
     dormant_row.update(
         condition="dormant",
+        **session_values(dormant_text),
         training_repeats=len(RE_SESSION.findall(dormant_text)),
         mlp_avg_time_us=dormant_avg,
         mlp_max_time_us=dormant_max,
@@ -463,8 +485,28 @@ def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: s
     return [flood_row, dormant_row]
 
 
+def migrate_csv_header(path: Path, fields: list) -> None:
+    """If `path` exists with a different header than `fields`, rewrite it with
+    the new header, keeping every existing row (new columns left blank), so
+    appending rows with the new schema never mis-aligns against an old header.
+    """
+    if not path.exists():
+        return
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == fields:
+            return
+        old_rows = list(reader)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, restval="")
+        writer.writeheader()
+        writer.writerows(old_rows)
+    log(f"Migrated {path.name} to the current column set ({len(old_rows)} existing row(s) kept)")
+
+
 def append_rows_to_csv(rows: list) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
+    migrate_csv_header(CSV_PATH, CSV_FIELDS)
     csv_is_new = not CSV_PATH.exists()
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
         writer = csv.DictWriter(csv_f, fieldnames=CSV_FIELDS)
@@ -500,6 +542,97 @@ def parse_profile_transcript(text: str, build_config: str, timestamp: str, git_c
     if not rows:
         raise BenchmarkError("Could not locate any per-stage 'avg=... max=...' lines in UART transcript")
     return rows
+
+
+PLACEMENT_CSV_FIELDS = [
+    "timestamp",
+    "git_commit",
+    "build_config",
+    "kind",
+    "name",
+    "address",
+    "addr_mod16",
+    "bank",
+    "log_file",
+]
+
+# tests/ProfileForwardBackward.cpp's PrintPlacement():
+#   "  placement data <name> addr=0x20001234 mod16=4"
+RE_PLACEMENT_DATA = re.compile(r"^\s*placement data (\S+)\s+addr=0x([0-9a-fA-F]+) mod16=(\d+)\s*$")
+# Hot code whose address the firmware cannot report reliably (the compiler may
+# emit out-of-line `.constprop` clones, or inline the kernel into the caller):
+# taken from the ELF symbol table instead. Demangled-name match.
+RE_HOT_CODE_SYMBOL = re.compile(
+    r"StaticLayer<.*>::(forward|AccumulateGradients|ApplyAccumulatedGradients|"
+    r"GetGradSumSquared|InitGradientAccumulators)\(|RunForwardBackwardProfile\(\)$"
+)
+
+
+def bank_of(address: int) -> str:
+    if 0x20000000 <= address < 0x20040000:
+        return "core0-bank"
+    if 0x20040000 <= address < 0x20080000:
+        return "core1-bank"
+    if 0x20080000 <= address < 0x20082000:
+        return "scratch"
+    return "other"
+
+
+def parse_placement_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    rows = []
+    for line in text.splitlines():
+        m = RE_PLACEMENT_DATA.match(line)
+        if not m:
+            continue
+        name, addr, mod16 = m.groups()
+        address = int(addr, 16)
+        rows.append(dict(
+            timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+            kind="data", name=name, address=f"0x{address:08x}", addr_mod16=mod16,
+            bank=bank_of(address), log_file=log_file,
+        ))
+    return rows
+
+
+def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    """Address / address%16 of every hot-kernel code symbol in the ELF."""
+    out = subprocess.run([nm, "-C", "-S", str(elf)], capture_output=True, text=True, check=True).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:  # symbols without a size column (-S) are not code we care about
+            continue
+        addr_s, _size, kind, name = parts
+        if kind not in ("T", "t", "W", "w"):
+            continue
+        if not RE_HOT_CODE_SYMBOL.search(name):
+            continue
+        address = int(addr_s, 16)
+        rows.append(dict(
+            timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+            kind="code", name=name, address=f"0x{address:08x}", addr_mod16=str(address % 16),
+            bank=bank_of(address), log_file=log_file,
+        ))
+    return rows
+
+
+def find_nm(build_dir: Path) -> str:
+    cache = build_dir / "CMakeCache.txt"
+    if cache.exists():
+        m = re.search(r"^CMAKE_NM:FILEPATH=(.+)$", cache.read_text(), re.M)
+        if m and Path(m.group(1)).exists():
+            return m.group(1)
+    return shutil.which("arm-none-eabi-nm") or "arm-none-eabi-nm"
+
+
+def append_placement_rows_to_csv(rows: list) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    csv_is_new = not PLACEMENT_CSV_PATH.exists()
+    with open(PLACEMENT_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
+        writer = csv.DictWriter(csv_f, fieldnames=PLACEMENT_CSV_FIELDS)
+        if csv_is_new:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def append_profile_rows_to_csv(rows: list) -> None:
@@ -564,6 +697,20 @@ Backward:
   backward total               avg=   2259.0 cycles   max=    2360 cycles
 Full forward+loss+backward total:
   full pass                    avg=   4230.3 cycles   max=    4470 cycles
+Per-batch stages (once per 128 samples; 20 iterations):
+  batch.zero_grads             avg=    900.0 cycles   max=     900 cycles
+  batch.grad_norm              avg=   1500.5 cycles   max=    1510 cycles
+  batch.rmsprop.layer0         avg=  90000.0 cycles   max=   90010 cycles
+  batch.rmsprop.layer1         avg=  45000.0 cycles   max=   45010 cycles
+  batch.rmsprop.layer2         avg=   7000.0 cycles   max=    7010 cycles
+  batch.rmsprop total          avg= 142000.0 cycles   max=  142030 cycles
+  batch total                  avg= 144400.5 cycles   max=  144450 cycles
+  batch total per sample       avg=    1128.0 cycles   max=    1128 cycles
+Placement (net and kernel code addresses; code addresses are added by
+RunAndSaveBenchmarks.py from the ELF symbol table):
+  placement data net                          addr=0x20008a30 mod16=0
+  placement data layer0.m_weights             addr=0x20008a34 mod16=4
+Profile complete.
 
 """
 
@@ -582,6 +729,8 @@ def run_self_test() -> None:
     assert dormant["other_core_iterations"] == "1"
     assert dormant["other_core_iteration_cap"] == "1"
     assert flood["correctness_identical"] == "PASS"
+    assert flood["session_losses"] == "0.123456;0.111111"
+    assert flood["session_accuracies"] == "0.900000;0.910000"
     assert flood["timing_verdict"] == "PASS"
     assert flood["timing_avg_diff_pct"] == "0.37"
 
@@ -592,13 +741,23 @@ def run_self_test() -> None:
     profile_rows = parse_profile_transcript(
         SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
     )
-    assert len(profile_rows) == 10
+    assert len(profile_rows) == 18
     assert profile_rows[0]["stage"] == "layer0.forward"
     assert profile_rows[0]["avg_cycles"] == "1234.5"
     assert profile_rows[0]["max_cycles"] == "1300"
     assert profile_rows[0]["iterations"] == "100"
-    assert profile_rows[-1]["stage"] == "full pass"
-    assert profile_rows[-1]["max_cycles"] == "4470"
+    assert profile_rows[9]["stage"] == "full pass"
+    assert profile_rows[9]["max_cycles"] == "4470"
+    assert profile_rows[-1]["stage"] == "batch total per sample"
+    assert profile_rows[-3]["stage"] == "batch.rmsprop total"
+
+    placement_rows = parse_placement_transcript(
+        SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
+    )
+    assert [r["name"] for r in placement_rows] == ["net", "layer0.m_weights"]
+    assert placement_rows[1]["addr_mod16"] == "4"
+    assert placement_rows[1]["address"] == "0x20008a34"
+    assert placement_rows[1]["bank"] == "core0-bank"
 
     log("Self-test OK: parser correctly extracts pinned, naive, and profile transcripts.")
 
@@ -747,6 +906,14 @@ def main(argv=None) -> int:
             str(profile_log_path.relative_to(REPO_ROOT)),
         )
         append_profile_rows_to_csv(profile_rows)
+        profile_log_rel = str(profile_log_path.relative_to(REPO_ROOT))
+        placement_rows = parse_placement_transcript(
+            profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
+        placement_rows += elf_code_placement_rows(
+            profile_cfg.elf_path, find_nm(profile_cfg.build_dir), profile_cfg.name,
+            profile_timestamp, git_commit, profile_log_rel)
+        append_placement_rows_to_csv(placement_rows)
+        log(f"Saved {len(placement_rows)} placement row(s) for {profile_cfg.name} to {PLACEMENT_CSV_PATH}")
         log(f"Saved {len(profile_rows)} row(s) for {profile_cfg.name} to {PROFILE_CSV_PATH}; raw log at {profile_log_path}")
 
     result_paths = []
@@ -754,6 +921,7 @@ def main(argv=None) -> int:
         result_paths.append(str(CSV_PATH))
     if not args.skip_profile:
         result_paths.append(str(PROFILE_CSV_PATH))
+        result_paths.append(str(PLACEMENT_CSV_PATH))
     log(f"\nAll done. Results in {' and '.join(result_paths)}")
     return 0
 

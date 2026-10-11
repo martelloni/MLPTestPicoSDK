@@ -47,6 +47,16 @@ struct Stat {
     }
 };
 
+/// Prints one stage's address for the placement record. The addr%16 column is
+/// what plan-mlpBetterOptimisation.md section 1.6 needs to correlate cycle
+/// counts with SRAM bank phase; RunAndSaveBenchmarks.py parses these lines
+/// ("placement data <name> addr=0x... mod16=N") into placement_results.csv.
+void PrintPlacement(const char* name, const void* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    printf("  placement data %-28s addr=0x%08lx mod16=%lu\n",
+           name, static_cast<unsigned long>(a), static_cast<unsigned long>(a & 15u));
+}
+
 void PrintStage(const char* name, const Stat & s) {
     printf("  %-28s avg=%9.1f cycles   max=%8lu cycles\n",
            name, static_cast<double>(s.avg()), static_cast<unsigned long>(s.max_val));
@@ -150,6 +160,73 @@ void RunForwardBackwardProfile() {
         full_total.add(t_fwd0 + t_fwd1 + t_fwd2 + t_loss + t_bwd2 + t_bwd1 + t_bwd0);
     }
 
+    // ── Phase 2: per-batch stages (once per 128 samples in TrainBatch) ──
+    // Measured separately from the per-sample loop above so the existing
+    // rows keep their meaning. Each iteration: zero the accumulators (timed),
+    // run one untimed forward+backward so the accumulators hold real
+    // gradients, then time the grad-norm computation and each layer's RMSProp
+    // apply. Weights drift over these iterations; timing is data-independent
+    // for these stages. The conditional clip rescale (ScaleAccumulatedGradients)
+    // is not measured: it runs only when the norm exceeds 5.0.
+    constexpr int kBatchIterations = 20;
+    constexpr std::size_t kBatchSize = 128; // matches MLPOpticalRecognition::Train
+    constexpr float kLearningRate = 0.01f;  // matches TestRAMIndependence
+    const dataset::DataType batch_inv = dataset::DataType(1) / static_cast<dataset::DataType>(kBatchSize);
+
+    Stat zero_stage, norm_stage, rms0, rms1, rms2, rms_total, batch_total;
+
+    for (int it = 0; it < kBatchIterations; ++it) {
+        const std::size_t s = static_cast<std::size_t>(it) % dataset::kNumExamples;
+
+        uint32_t ints = save_and_disable_interrupts();
+        uint32_t t0 = Cycles();
+        layer0.InitGradientAccumulators();
+        layer1.InitGradientAccumulators();
+        layer2.InitGradientAccumulators();
+        const uint32_t t_zero = Cycles() - t0;
+        restore_interrupts(ints);
+
+        // Untimed: populate the accumulators with a real sample's gradients.
+        layer0.forward(dataset::features[s].data(), buf_a.data());
+        layer1.forward(buf_a.data(), buf_b.data());
+        layer2.forward(buf_b.data(), pred.data());
+        smlp::compute_loss<loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>(
+            dataset::labels[s].data(), pred.data(), deriv.data(), dataset::kLabelSize, dataset::DataType(1));
+        layer2.AccumulateGradients(layer2.m_cached_input.data(), deriv.data(), delta_b.data());
+        layer1.AccumulateGradients(layer1.m_cached_input.data(), delta_b.data(), delta_a.data());
+        layer0.AccumulateGradients(layer0.m_cached_input.data(), delta_a.data(), delta_layer0.data());
+
+        ints = save_and_disable_interrupts();
+        t0 = Cycles();
+        dataset::DataType sumsq = dataset::DataType(0);
+        sumsq += layer0.GetGradSumSquared(batch_inv);
+        sumsq += layer1.GetGradSumSquared(batch_inv);
+        sumsq += layer2.GetGradSumSquared(batch_inv);
+        const dataset::DataType norm = smlp::nn::sqrt(sumsq);
+        const uint32_t t_norm = Cycles() - t0;
+        // Keep `norm` live so the compiler cannot discard the bracketed work.
+        asm volatile("" : : "r"(norm) : "memory");
+
+        t0 = Cycles();
+        layer0.ApplyAccumulatedGradients(kLearningRate, batch_inv);
+        const uint32_t t_rms0 = Cycles() - t0;
+        t0 = Cycles();
+        layer1.ApplyAccumulatedGradients(kLearningRate, batch_inv);
+        const uint32_t t_rms1 = Cycles() - t0;
+        t0 = Cycles();
+        layer2.ApplyAccumulatedGradients(kLearningRate, batch_inv);
+        const uint32_t t_rms2 = Cycles() - t0;
+        restore_interrupts(ints);
+
+        zero_stage.add(t_zero);
+        norm_stage.add(t_norm);
+        rms0.add(t_rms0);
+        rms1.add(t_rms1);
+        rms2.add(t_rms2);
+        rms_total.add(t_rms0 + t_rms1 + t_rms2);
+        batch_total.add(t_zero + t_norm + t_rms0 + t_rms1 + t_rms2);
+    }
+
     printf("\nForward/backward cycle profile (%d iterations, network 64-64-32-10):\n", kIterations);
     printf("Forward:\n");
     PrintStage("layer0.forward", fwd0);
@@ -165,6 +242,39 @@ void RunForwardBackwardProfile() {
     PrintStage("backward total", bwd_total);
     printf("Full forward+loss+backward total:\n");
     PrintStage("full pass", full_total);
+
+    printf("Per-batch stages (once per %u samples; %d iterations):\n",
+           static_cast<unsigned>(kBatchSize), kBatchIterations);
+    PrintStage("batch.zero_grads", zero_stage);
+    PrintStage("batch.grad_norm", norm_stage);
+    PrintStage("batch.rmsprop.layer0", rms0);
+    PrintStage("batch.rmsprop.layer1", rms1);
+    PrintStage("batch.rmsprop.layer2", rms2);
+    PrintStage("batch.rmsprop total", rms_total);
+    PrintStage("batch total", batch_total);
+    // Amortised per sample so it compares directly with "full pass".
+    {
+        Stat per_sample;
+        per_sample.add(static_cast<uint32_t>(batch_total.sum / batch_total.count / kBatchSize));
+        PrintStage("batch total per sample", per_sample);
+    }
+
+    printf("Placement (net and kernel code addresses; code addresses are added by\n");
+    printf("RunAndSaveBenchmarks.py from the ELF symbol table):\n");
+    PrintPlacement("net", &net);
+    PrintPlacement("layer0.m_weights", layer0.m_weights.data());
+    PrintPlacement("layer0.m_grad_accum", layer0.m_grad_accum.data());
+    PrintPlacement("layer0.m_cached_input", layer0.m_cached_input.data());
+    PrintPlacement("layer1.m_weights", layer1.m_weights.data());
+    PrintPlacement("layer1.m_grad_accum", layer1.m_grad_accum.data());
+    PrintPlacement("layer1.m_cached_input", layer1.m_cached_input.data());
+    PrintPlacement("layer2.m_weights", layer2.m_weights.data());
+    PrintPlacement("layer2.m_grad_accum", layer2.m_grad_accum.data());
+    PrintPlacement("layer2.m_cached_input", layer2.m_cached_input.data());
+    PrintPlacement("delta_a", delta_a.data());
+    PrintPlacement("delta_b", delta_b.data());
+    PrintPlacement("delta_layer0", delta_layer0.data());
+    printf("Profile complete.\n");
     printf("\n");
 }
 

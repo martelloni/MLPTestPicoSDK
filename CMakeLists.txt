@@ -92,6 +92,8 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/LossTest.cpp
         tests/unit/StaticMLPTrainBatchTest.cpp
         tests/unit/StaticMLPForwardAccumulatorTest.cpp
+        tests/unit/StaticLayerAccumulateGradientsTest.cpp
+        tests/unit/FastMathTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
 elseif(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
     # ProfileForwardBackward.cpp only ever names MLPOpticalRecognition::Net
@@ -179,6 +181,25 @@ if(MEML_MLP_RUNS_ON_CORE STREQUAL "1")
             ${CMAKE_CURRENT_SOURCE_DIR}/linker/core1-only
             FILES section_copy_to_ram_text.incl)
 endif()
+
+# The MLP hot path must not call into libc: the SDK's memcpy/memset live in
+# core 0's bank, so a core-1-pinned MLP would silently depend on it. GCC's
+# loop-distribution pass turns plain copy/zero loops (forward()'s cached-input
+# copy, delta zeroing, array fill) into memcpy/memset libcalls; switching that
+# one pass off in the TUs that instantiate the MLP keeps them as inline loops.
+# Applied to every configuration (not just pinned) so the three builds stay
+# comparable. scripts/validate_memory_placement.py's callee-closure check is
+# what enforces the result.
+set(MEML_MLP_TUS
+        experiments/MLPOpticalRecognition.cpp
+        tests/ProfileForwardBackward.cpp
+        tests/unit/StaticMLPTrainBatchTest.cpp
+        tests/unit/StaticMLPForwardAccumulatorTest.cpp
+        tests/unit/MLPOpticalRecognitionTest.cpp
+        tests/unit/LossTest.cpp
+        tests/unit/StaticLayerAccumulateGradientsTest.cpp
+        tests/unit/FastMathTest.cpp)
+set_source_files_properties(${MEML_MLP_TUS} PROPERTIES COMPILE_OPTIONS "-fno-tree-loop-distribute-patterns")
 
 pico_set_program_name(MLPTestPicoSDK "MLPTestPicoSDK")
 pico_set_program_version(MLPTestPicoSDK "0.1")
@@ -287,6 +308,7 @@ add_custom_command(TARGET MLPTestPicoSDK POST_BUILD
                 --core "${MEML_MLP_RUNS_ON_CORE}"
                 --readelf ${CMAKE_READELF}
                 --nm ${CMAKE_NM}
+                --objdump ${CMAKE_OBJDUMP}
                 --mode ${RUN_TESTS_OR_BENCHMARKS}
                 --engine ${MEML_MLP_ENGINE}
         COMMENT "Validating core-0/core-1 memory placement"

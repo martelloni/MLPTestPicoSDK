@@ -48,6 +48,23 @@ linker defaulted into core 0's bank regardless of pin. Fixed via
 must fall in the right window) — don't trust a green build alone unless you
 know the check covers it (see below).**
 
+## Callee closure: the hot path must not call out of its bank
+
+`validate_memory_placement.py`'s `check_callee_closure` disassembles every
+hot-path symbol (same prefix set as above) and fails if any `bl`/`b` target,
+or any literal-pool function pointer, lies outside the pinned core's window.
+It catches libc/libm helpers and compiler libcalls (`memcpy`, `memset`,
+`__wrap_expf`, ...) that the symbol-address checks cannot see. Hence:
+- MLP TUs are compiled with `-fno-tree-loop-distribute-patterns`
+  (`MEML_MLP_TUS` in `CMakeLists.txt`) so copy/zero loops stay inline instead
+  of becoming `memcpy`/`memset` calls. A new TU that instantiates the MLP must
+  be added to that list. Avoid `std::array` assignment/`fill` of large arrays
+  in hot-path code outside those TUs.
+- exp/log in the loss use `smlp::exp_f32`/`log_f32` (`mlp/FastMath.h`), not
+  libm: pico_float's `__wrap_expf`/`__wrap_logf` live in core 0's bank and are
+  shared with core 0's own code, so they must not be redirected either.
+- The check needs `--objdump`; CMake passes `${CMAKE_OBJDUMP}`.
+
 ## Untagged code needs its own check
 
 Most MLP code is placed via `SMLP_CODE_ATTR` and caught by

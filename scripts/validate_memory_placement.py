@@ -20,6 +20,11 @@ Checks the four guarantees Step 1 of plan-mlpCoreLocalPrompt.md establishes:
      MEML_RUNS_ON_CORE(_CODE) no longer forces `noinline`, most of the mlp/
      hot path inlines into these and leaves no symbol of its own -- this
      check is what still proves the whole thing landed in the right place.
+  7. Callee closure: every `bl`/`b` target (and every literal-pool function
+     pointer) inside an mlp hot-path symbol's body lies inside the pinned
+     core's window -- i.e. the hot path does not call into code (memcpy,
+     memset, expf, ...) that lives in the other core's bank. Checks 4/5 only
+     look at where the mlp symbols themselves sit, not what they call.
   6. ("benchmarks" mode only) None of nn::fmul/nn::scale/smlp::activate
      appear as their own out-of-line symbol -- a regression canary for the
      exact "one call per weight" slowdown this scheme was fixed to avoid.
@@ -245,6 +250,122 @@ def check_mlp_entry_points(symbols, core, errors, mode, facade="MLPOpticalRecogn
                 )
 
 
+# Branch mnemonics whose operand is a direct code address. Indirect forms
+# (bx/blx reg, ldr pc, tbb/tbh) carry no resolvable target in the listing and
+# are not covered; literal-pool function pointers are handled separately.
+_BRANCH_MNEMONIC = re.compile(
+    r"^(?:bl|b|cbz|cbnz)(?:eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)?(?:\.[nw])?$"
+)
+_FUNC_HEADER = re.compile(r"^([0-9a-fA-F]+) <(.+)>:$")
+_INSN_LINE = re.compile(r"^\s*([0-9a-fA-F]+):\t[0-9a-fA-F ]+\t(\S+)(?:\s+(.*))?$")
+_BRANCH_TARGET = re.compile(r"^([0-9a-fA-F]+) <([^>]+)>")
+_LITERAL_WORD = re.compile(r"^\s*[0-9a-fA-F]+:\t[0-9a-fA-F ]+\t\.word\t(0x[0-9a-fA-F]+)")
+
+
+def parse_function_symbols(nm_output):
+    """Return {address: name} for text symbols (nm types T/t/W/w)."""
+    funcs = {}
+    for line in nm_output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[1] not in ("T", "t", "W", "w"):
+            continue
+        try:
+            funcs.setdefault(int(parts[0], 16), parts[2])
+        except ValueError:
+            continue
+    return funcs
+
+
+def collect_callees(disassembly, wanted):
+    """Walk `objdump -d` output. For every function whose symbol name satisfies
+    `wanted(name)`, yield (caller, caller_addr, callee_name_or_addr, target_addr,
+    kind) for each direct branch leaving the function body and each literal-pool
+    word that equals a known function address (resolved by the caller)."""
+    caller = None
+    caller_start = None
+    body = []
+    results = []
+    for line in disassembly.splitlines():
+        header = _FUNC_HEADER.match(line)
+        if header:
+            if caller is not None:
+                results.append((caller, caller_start, body))
+            caller_start = int(header.group(1), 16)
+            caller = header.group(2) if wanted(header.group(2)) else None
+            body = []
+            continue
+        if caller is None:
+            continue
+        m = _INSN_LINE.match(line)
+        if m:
+            addr = int(m.group(1), 16)
+            mnemonic, operands = m.group(2), m.group(3) or ""
+            if _BRANCH_MNEMONIC.match(mnemonic):
+                t = _BRANCH_TARGET.match(operands.strip().split(";")[0].strip())
+                if t:
+                    body.append(("branch", addr, int(t.group(1), 16), t.group(2)))
+            continue
+        w = _LITERAL_WORD.match(line)
+        if w:
+            body.append(("word", None, int(w.group(1), 16), None))
+    if caller is not None:
+        results.append((caller, caller_start, body))
+    return results
+
+
+def check_callee_closure(symbols_nm, disassembly, core, errors):
+    """Fail if any mlp hot-path symbol branches to (or holds a function pointer
+    to) code outside the pinned core's window.
+
+    The window is the core's own 256 KiB bank. Branches whose target stays
+    inside the calling function (loops, early exits) are ignored. Matches the
+    symbol set of check_mlp_symbol_placement (same prefixes, ctor/dtor and
+    allowlist exemptions). Reports one line per (caller, callee) pair.
+    """
+    lo, hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
+    funcs = parse_function_symbols(symbols_nm)
+
+    def is_hot(name):
+        base = name.split("+")[0]
+        return (base.startswith(_MLP_SYMBOL_PREFIXES) and not _is_ctor_or_dtor(base)
+                and not any(a in base for a in _MLP_SYMBOL_ALLOWLIST))
+
+    # A function's extent is [its start, next function symbol's start).
+    starts = sorted(funcs)
+
+    def extent_end(start):
+        import bisect
+        i = bisect.bisect_right(starts, start)
+        return starts[i] if i < len(starts) else start + 1
+
+    seen = set()
+    for caller, cstart, body in collect_callees(disassembly, is_hot):
+        cend = extent_end(cstart)
+        for kind, _addr, target, tname in body:
+            if kind == "word":
+                if target not in funcs:
+                    continue  # data constant, not a function pointer
+                tname = funcs[target]
+                what = "function pointer to"
+            else:
+                what = "calls"
+            if cstart <= target < cend:
+                continue
+            if lo <= target < hi:
+                continue
+            key = (caller, tname.split("+")[0], what)
+            if key in seen:
+                continue
+            seen.add(key)
+            fail(
+                errors,
+                f"mlp hot-path symbol '{caller}' {what} '{tname}' at {target:#x}, "
+                f"outside the pinned core's window [{lo:#x}, {hi:#x}) -- the "
+                "hot path depends on code in another bank (untagged callee, "
+                "libc/libm helper or compiler-emitted libcall)",
+            )
+
+
 def check_mlp_inlining_canary(symbols, errors):
     """Benchmarks-mode regression canary: fail if a scalar per-weight helper
     that should be fully inlined into the training loop shows up as its own
@@ -348,6 +469,8 @@ def main():
     parser.add_argument("--core", default="", help="MEML_MLP_RUNS_ON_CORE value: '', '0', or '1'")
     parser.add_argument("--readelf", default="arm-none-eabi-readelf")
     parser.add_argument("--nm", default="arm-none-eabi-nm")
+    parser.add_argument("--objdump", default="arm-none-eabi-objdump",
+                        help="Used by the callee-closure check to disassemble hot-path symbols")
     parser.add_argument(
         "--mode", default="tests", choices=("tests", "benchmarks", "profile"),
         help="RUN_TESTS_OR_BENCHMARKS value: 'tests' links MLPOpticalRecognitionTest.cpp's "
@@ -365,7 +488,8 @@ def main():
     args = parser.parse_args()
 
     sections = parse_sections(run(args.readelf, ["-SW", args.elf]))
-    symbols = parse_symbols(run(args.nm, [args.elf]))
+    nm_output = run(args.nm, [args.elf])
+    symbols = parse_symbols(nm_output)
 
     errors = []
     if args.core == "":
@@ -398,6 +522,7 @@ def main():
         else:
             check_mlp_symbol_placement(symbols, args.core, errors)
             check_mlp_entry_points(symbols, args.core, errors, args.mode)
+            check_callee_closure(nm_output, run(args.objdump, ["-d", args.elf]), args.core, errors)
         if args.mode == "tests":
             check_placement_probe(symbols, args.core, errors)
         else:

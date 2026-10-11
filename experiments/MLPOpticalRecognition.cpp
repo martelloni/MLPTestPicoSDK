@@ -64,7 +64,11 @@ MLPOpticalRecognition::Result MLPOpticalRecognition::Train(uint32_t epochs, floa
 }
 
 uint32_t MLPOpticalRecognition::Predict(const std::array<dataset::DataType, dataset::kFeatureSize> & input) {
-    state_.input_scratch = input; // stable, core-local copy before inference
+    // Stable, core-local copy before inference. An explicit loop, not
+    // `state_.input_scratch = input`: the array assignment lowers to a memcpy
+    // libcall, which lives in core 0's bank (see validate_memory_placement.py's
+    // callee-closure check).
+    for (std::size_t i = 0; i < dataset::kFeatureSize; ++i) state_.input_scratch[i] = input[i];
     state_.net.GetOutput(state_.input_scratch.data(), state_.output_scratch.data(), /*for_inference=*/false);
     std::size_t predicted = 0;
     state_.net.GetOutputClass(state_.output_scratch.data(), &predicted);
