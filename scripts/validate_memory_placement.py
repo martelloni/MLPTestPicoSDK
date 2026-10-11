@@ -500,17 +500,18 @@ def main():
         if args.engine == "baseline":
             check_baseline_heap_headroom(symbols, errors)
     elif args.mode == "profile":
-        # ProfileForwardBackward.cpp only names MLPOpticalRecognition::Net (a
-        # type alias) and never instantiates the MLPOpticalRecognition class,
-        # so none of the tagged entry-point symbols the other modes require
-        # (Initialise/Train/Predict, g_experiment, mlp_experiment_/
-        # ram_flooder_) exist in this ELF at all -- there is nothing
-        # meaningful left to check beyond the generic bank-bounds/flash
-        # checks every pinned build gets.
+        # ProfileForwardBackward.cpp times the real MLPOpticalRecognition facade
+        # (Step 0.5), so the MLP symbols, entry points and their callees are
+        # present and checked exactly as in a benchmark build. It has no
+        # g_experiment/mlp_experiment_/ram_flooder_ probe objects, and its own
+        # harness code (namespace test::profile) is outside the MLP prefixes.
         check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
         for name in CORE1_SECTIONS:
             check_bank_bounds(sections, name, RAM1_BASE, RAM1_END, errors)
         check_flash_outside_ram(sections, errors)
+        check_mlp_symbol_placement(symbols, args.core, errors)
+        check_mlp_entry_points(symbols, args.core, errors, args.mode)
+        check_callee_closure(nm_output, run(args.objdump, ["-d", args.elf]), args.core, errors)
     else:
         check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
         for name in CORE1_SECTIONS:

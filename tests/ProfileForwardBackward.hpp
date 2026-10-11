@@ -30,7 +30,12 @@ namespace profile {
 /// timing each layer's forward() and AccumulateGradients() call (plus the
 /// loss/gradient computation between them) with the DWT cycle counter, and
 /// prints avg/max cycles per stage over UART/USB stdout.
-void RunForwardBackwardProfile();
+///
+/// Also (see plan-mlpBetterOptimisation.md Step 0.5): runs on the core the MLP
+/// is pinned to, adds per-batch stages, bus-contention counters per stage, the
+/// production MLPOpticalRecognition::Train path (train.* rows), and the
+/// placement of every stream the kernels touch.
+void RunProfiles();
 
 } // namespace profile
 } // namespace test

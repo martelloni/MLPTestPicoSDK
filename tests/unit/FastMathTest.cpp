@@ -139,6 +139,68 @@ bool CrossEntropyMatchesDoubleReference() {
     return true;
 }
 
+// Restricted-domain variants used by the loss (Step 0.5, 2d).
+bool ExpNonposMatchesStd() {
+    // Relative error budget: 1.1e-7 polynomial + float rounding, plus the
+    // rounded log2e constant's |x|*1.9e-8*ln2 contribution, which only matters
+    // far below the max logit (e^-16 is already 1e-7 of the leading term).
+    auto tol = [](float x) { return 3e-7f + 1.5e-8f * std::fabs(x); };
+    for (int i = 0; i <= 8600; ++i) {
+        const float x = -0.01f * static_cast<float>(i); // [-86, 0]
+        if (!(RelErr(smlp::exp_nonpos_f32(x), std::exp(static_cast<double>(x))) < tol(x))) return false;
+    }
+    for (std::size_t i = 0; i < 2000; ++i) {
+        const float x = -30.0f * (PseudoRandom(i, 0x77u) * 0.5f + 0.5f);
+        if (!(RelErr(smlp::exp_nonpos_f32(x), std::exp(static_cast<double>(x))) < tol(x))) return false;
+    }
+    return true;
+}
+
+bool ExpNonposEdges() {
+    if (smlp::exp_nonpos_f32(0.0f) != 1.0f) return false;
+    if (smlp::exp_nonpos_f32(-87.0f) != 0.0f) return false;
+    if (smlp::exp_nonpos_f32(-100.0f) != 0.0f) return false;
+    if (smlp::exp_nonpos_f32(-1000.0f) != 0.0f) return false;
+    return smlp::exp_nonpos_f32(-86.0f) > 0.0f; // still representable, not denormal garbage
+}
+
+bool LogGe1MatchesStd() {
+    for (int i = 0; i <= 2000; ++i) {
+        const float x = 1.0f + 0.005f * static_cast<float>(i); // [1, 11]
+        const double want = std::log(static_cast<double>(x));
+        if (!(std::fabs(static_cast<double>(smlp::log_ge1_f32(x)) - want) < 5e-7)) return false;
+    }
+    if (smlp::log_ge1_f32(1.0f) != 0.0f) return false;
+    return std::fabs(smlp::log_ge1_f32(10.0f) - 2.302585093f) < 5e-7f; // sum == n_classes
+}
+
+// Full-range logit sweep through the real consumer: loss and gradient against
+// a double reference, including very negative logits and a one-class spike.
+bool CrossEntropySweep() {
+    constexpr std::size_t kN = 10;
+    for (std::size_t trial = 0; trial < 200; ++trial) {
+        float logits[kN], target[kN] = {}, grad[kN];
+        double lmax = -1e30;
+        const float span = 1.0f + 0.5f * static_cast<float>(trial % 100); // up to ~50
+        for (std::size_t i = 0; i < kN; ++i) {
+            logits[i] = span * PseudoRandom(trial * kN + i, 0x2222u);
+            if (logits[i] > lmax) lmax = logits[i];
+        }
+        target[trial % kN] = 1.0f;
+        double sum = 0.0;
+        for (std::size_t i = 0; i < kN; ++i) sum += std::exp(static_cast<double>(logits[i]) - lmax);
+        const double lse = lmax + std::log(sum);
+        const double want_loss = -(static_cast<double>(logits[trial % kN]) - lse);
+        const float got = loss::CategoricalCrossEntropyLogits(target, logits, grad, kN, 1.0f);
+        if (!(std::fabs(static_cast<double>(got) - want_loss) < 2e-5 * (1.0 + std::fabs(want_loss)))) return false;
+        for (std::size_t i = 0; i < kN; ++i) {
+            const double want_g = std::exp(static_cast<double>(logits[i]) - lse) - target[i];
+            if (!(std::fabs(static_cast<double>(grad[i]) - want_g) < 2e-6)) return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 // One UNIT, not one per check: microunit holds at most 32 tests
@@ -152,6 +214,10 @@ UNIT(FastMathMatchesReference) {
     ok &= Check("LogMatchesStdOverWideRange", LogMatchesStdOverWideRange());
     ok &= Check("LogSpecialValues", LogSpecialValues());
     ok &= Check("CrossEntropyMatchesDoubleReference", CrossEntropyMatchesDoubleReference());
+    ok &= Check("ExpNonposMatchesStd", ExpNonposMatchesStd());
+    ok &= Check("ExpNonposEdges", ExpNonposEdges());
+    ok &= Check("LogGe1MatchesStd", LogGe1MatchesStd());
+    ok &= Check("CrossEntropySweep", CrossEntropySweep());
     ASSERT_TRUE(ok);
     PASS();
 }

@@ -96,13 +96,12 @@ if(RUN_TESTS_OR_BENCHMARKS STREQUAL "tests")
         tests/unit/FastMathTest.cpp
         tests/unit/MLPOpticalRecognitionTest.cpp)
 elseif(RUN_TESTS_OR_BENCHMARKS STREQUAL "profile")
-    # ProfileForwardBackward.cpp only ever names MLPOpticalRecognition::Net
-    # (a type alias), never instantiates the MLPOpticalRecognition class
-    # itself, so experiments/MLPOpticalRecognition.cpp's out-of-line
-    # Initialise/Train/Predict are never odr-used and don't need linking --
-    # just the dataset storage the profiler reads samples from.
+    # ProfileForwardBackward.cpp times the real MLPOpticalRecognition facade
+    # (Initialise/Train) as well as the per-layer kernels, so it links the same
+    # experiment translation unit the benchmark does.
     list(APPEND MLPTestPicoSDK_SOURCES
         dataset/Dataset.cpp
+        experiments/MLPOpticalRecognition.cpp
         tests/ProfileForwardBackward.cpp)
 else()
     # TestRAMIndependence (pinned builds) and TestNaiveMemoryLayout (unpinned

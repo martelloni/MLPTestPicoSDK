@@ -165,6 +165,41 @@ cheap and measured cross-core impact is tiny (0.09%), but they contradict the
 partly free (Steps 3 and 4 remove `memcpy` and `memset`) and partly new work
 (`expf`/`logf`, Step 0).
 
+### 1.8 Results after Step 0 (`070f5aa`) and what they changed
+
+Dormant benchmark: core0 **43.52 s**, core1 **42.97 s**, naive **42.97 s**
+(all three were 42.52 s at `8fb216e`). Per-layer profile, per sample:
+
+| | core0 | core1 | naive |
+|---|---|---|---|
+| `layer1.forward` | 11,968 | 11,960 | **12,992** |
+| `compute_loss` | 2,315 | 2,315 | 2,315 (was 728) |
+| full pass | 155,034 | 154,904 | 156,027 |
+
+- **Step 0 caused a regression:** `compute_loss` is 1.6k cycles/sample slower
+  (private Cephes `expf`/`logf` versus pico's). That is about 0.4 s per
+  session, exactly the rise in core1 and naive. Fixed in Step 0.5 (2d).
+- **Core 0's extra 0.55 s (about 2.2k cycles/sample) is not visible in the
+  profile**, which says core0 and core1 are within 0.1%. The profile harness
+  calls the layer kernels directly and always executes on core 0; production
+  runs the inlined backward in `Train` on the pinned core. So the profile is a
+  diagnostic for the kernels it calls, not a proxy for the benchmark.
+  (This matches the header comment of `ProfileForwardBackward.hpp`: an earlier
+  regression was whole-function register allocation, invisible to kernel-level
+  views.)
+- **The layer-1 forward +1024 on naive reproduced exactly** with a different
+  link layout, so it is deterministic placement, not noise.
+- **The simple phase-mod-16 explanation in 1.6 is not supported.** Last time:
+  naive loop head mod 16 = 0 (slow), core0 = 8 (fast). Now: naive = 8 (slow),
+  core0 = 4 (fast). Data phases are identical (8) in both. Layer 0 is
+  insensitive (loop heads 0/0/12, times equal). The placement logging also
+  omitted streams the kernel touches. The bank-collision idea stays plausible,
+  but the mechanism is unproven: Step 0.5 tests it with hardware contention
+  counters rather than address arithmetic.
+- Useful new data: per-batch RMSProp is 481k cycles (74 cycles/weight) and
+  the whole per-batch overhead is 4.5k cycles/sample (2.9% of the pass), which
+  supports Step 6.
+
 ---
 
 ## 2. Step overview and expected cumulative effect
@@ -174,7 +209,8 @@ estimated full-pass time after the step.
 
 | # | Step | Est. cycles saved/sample | Cum. pass | Risk |
 |---|---|---|---|---|
-| 0 | Measurement guard rails + callee-closure validator | 0 | 157k | none |
+| 0 | Measurement guard rails + callee-closure validator (done, `070f5aa`) | +1.6k (loss regression) | ~158k | none |
+| 0.5 | Production-path probe, bus-contention counters, fix the `expf`/`logf` cost | -1.2 to -1.6k (loss) | ~157k | low |
 | 1 | Test the placement hypothesis (alignment control, then scratch banks) | 0-12k (mostly variance removal) | ~145-157k | medium (linker) |
 | 2 | Skip layer-0 input-gradient | ~33k | ~124k | very low |
 | 3 | Row-blocked forward | ~19-21k | ~104k | low |
@@ -183,8 +219,9 @@ estimated full-pass time after the step.
 | 6 | RMSProp / loop-level cleanup (optional) | ~1-2.5 s per session | n/a | low |
 
 Steps 2-4 together: about **1.8-2.2x** end-to-end (about 19-24 s per session
-against 42.5 s today). Step order is by value/risk, but **Step 0 first,
-Step 1 early** so that later gains can be measured above the placement noise.
+against 42.5 s today). Step order is by value/risk, but **Steps 0 and 0.5
+first, Step 1 early** so that later gains can be measured above the placement
+noise.
 
 ---
 
@@ -197,9 +234,11 @@ smaller steps, and the validator cannot see cross-core callees (1.7). Without
 fixing both, "faster" cannot be trusted and the independence claim has holes.
 
 **2. Implementation.**
-- **Profile as primary metric.** The DWT profile (`ProfileForwardBackward.cpp`)
-  is deterministic to about 0.1%. Treat the 40 s benchmark as final
-  confirmation only. Extend the profile to print and record:
+- **Profile as a kernel-level diagnostic.** The DWT profile
+  (`ProfileForwardBackward.cpp`) is deterministic to about 0.1% for the
+  kernels it calls, but **does not run the production `Train` path** (see
+  1.8); Step 0.5 adds that. Treat the 40 s benchmark as final confirmation.
+  Extend the profile to print and record:
   - stage rows for RMSProp apply (`ApplyAccumulatedGradients` per layer),
     gradient zeroing and the grad-norm step, so the 6% loop overhead is
     measured rather than inferred;
@@ -246,9 +285,210 @@ negatives and the 10-way log-sum-exp). Run the validator on `build-core0` and
 
 ---
 
+### Step 0.5 - Production-path measurement, bus-contention counters, and the `expf`/`logf` cost
+
+Do this after Step 0 (commit `070f5aa`) and **before Step 1**. See 1.8 for what
+the Step 0 results showed and why this step is needed.
+
+**1. Rationale.** Step 0's results (1.8) exposed three gaps that make Step 1
+impossible to judge:
+1. The per-layer profile does not run the production code (backward is inlined
+   into `MLPOpticalRecognition::Train`, with its own loop addresses) and it
+   always runs on core 0, even for the "core1" build. It cannot see core 0's
+   extra +0.55 s in the benchmark.
+2. The hypothesis in 1.6 is currently supported by one data point and
+   contradicted by another (loop phase mod 16 does not predict which build is
+   slow). Instead of guessing from addresses, the RP2350 can **count contested
+   SRAM accesses directly**. Bank collisions are testable, not inferable.
+3. Step 0's private Cephes `expf`/`logf` made `compute_loss` 3x slower
+   (728 -> 2,315 cycles/sample, about +0.4 s per session) and that must be
+   removed before it hides the effect of later steps.
+
+**2. Implementation.**
+
+*2a. Production-path probe (new profile mode, same binary as the benchmark).*
+- In `tests/ProfileForwardBackward.cpp` add `RunTrainPathProfile()`, called
+  from `main.cpp` in `MEML_RUN_PROFILE` after the per-layer profile.
+- It must call the **real facade** `MLPOpticalRecognition::Initialise(seed)`
+  and `Train(epochs, lr)`, not a copy of the loop. Only then are the measured
+  instructions the benchmark's instructions at the benchmark's addresses.
+  Measure with the DWT `CYCCNT` (already enabled by `EnableCycleCounter()`):
+  - `T0` = cycles for `Train(0, lr)` (a weight-less evaluation pass over all
+    3823 samples: forward + loss only);
+  - `T1` = cycles for `Train(1, lr)` right after `Initialise(seed)`;
+  - report `T0`, `T1`, `(T1 - T0) / 3823` per sample (training cost without
+    the evaluation pass), and the ratio to the sum of per-layer stage averages
+    from the existing profile (the "unexplained" difference is the
+    production-versus-harness gap). One epoch is about 4 s, well inside the
+    28 s 32-bit `CYCCNT` wrap at 150 MHz. Repeat 3 times and print each.
+  - Do not mask interrupts for the whole epoch (USB stdio would starve);
+    the few USB ISR bursts are small and identical across builds. Print the
+    min of the 3 repeats.
+- **Run it on the pinned core.** For `MEML_MLP_RUNS_ON_CORE=1` launch the
+  probe on core 1 (reuse the launch mechanism of `TestRAMIndependence`) with
+  core 0 idle in WFE exactly as in the "dormant" benchmark run; for `0` and
+  the unpinned build run on core 0. `CYCCNT` is per core: enable it on the
+  core that runs the probe. Do the same for the existing per-layer profile so
+  its "core1" rows really measure core 1.
+- Add rows to `profiling_results.csv` with new stage names: `train.eval_pass`,
+  `train.epoch`, `train.epoch_minus_eval_per_sample` (extend
+  `parse_profile_transcript`/`RE_PROFILE_STAGE` accordingly).
+
+*2b. Bus-contention counters (the direct test of 1.6).*
+- RP2350 `busctrl_hw` has 4 saturating 24-bit counters
+  (`busctrl_hw->counter[0..3]`, each with `perfsel`/`perfctr`, enabled by
+  `busctrl_hw->perfctr_en`). Events per arbiter include `SRAMn_ACCESS` and
+  `SRAMn_ACCESS_CONTESTED` for n = 0..9 (`hardware/regs/busctrl.h`,
+  `BUSCTRL_PERFSELx_VALUE_SRAMn_ACCESS_CONTESTED`). A contested access means
+  the arbiter delayed one master because another wanted the same slave in the
+  same cycle. With the other core idle (dormant) and no DMA, contention can
+  only be between this core's own fetch and data ports.
+- In the per-layer profile, bracket each stage with counter snapshots in
+  passes of 4 counters: pass 1 = `SRAM0..3_ACCESS_CONTESTED`, pass 2 =
+  `SRAM4..7_ACCESS_CONTESTED`, pass 3 = `SRAM8, SRAM9` contested plus
+  `SRAM0` and `SRAM4` `ACCESS` as sanity totals. Re-run the 100-iteration loop
+  once per pass (the cycle numbers must reproduce between passes; if they
+  drift, the counters are perturbing the measurement and the pass is invalid).
+  Reading a counter is a 32-bit load from the APB-side peripheral bus: do it
+  outside the timed bracket (read before `t0`, after `t1`) so the load itself
+  does not add contention inside the bracket.
+- Add a CSV, `benchmark_results/contention_results.csv`, with columns
+  `timestamp, git_commit, build_config, stage, sram_bank, contested_avg,
+  access_avg, log_file`, written by the same script path as
+  `placement_results.csv`.
+- Do the same bracket around the production-path probe of 2a (whole
+  `Train(1)`): one total per SRAM bank per pass.
+
+*2c. Placement data for everything the kernels touch.*
+- Extend the `PrintPlacement` list with the streams currently missing:
+  each layer's `m_inner_products`, `m_act_output`, `m_biases`,
+  `m_bias_grad_accum`; the harness `buf_a`, `buf_b`, `pred`, `deriv`, plus the
+  stack pointer at probe entry, and in the production probe the
+  `MLPOpticalRecognition` instance (`state_`, `shuffle_indices`).
+- Extend `elf_code_placement_rows` to emit, per hot symbol, the address of
+  **every inner loop** (a backward conditional branch whose target is within
+  the symbol) as `kind=loop`, with loop length and `addr % 16` of the head.
+  Include `MLPOpticalRecognition::Train` (backward loops are inlined here) and
+  the `for_each_layer` lambda that runs RMSProp. Use `objdump -d` as in the
+  analysis snippet in this plan's history, run by the script after each
+  build. These rows are the join key between the cycle/contention results
+  and code position.
+
+*2d. Remove the `expf`/`logf` regression.*
+- Exit criterion: `compute_loss` stage in the profile back to **<= 1,000
+  cycles** (the baseline with pico's routines was 728; each 100 cycles is
+  about 0.1 s per session), with `FastMathTest` still green and no callee
+  outside the pinned bank.
+- Ways to get there, in order of simplicity (profile after each):
+  1. Specialise for the **restricted domains the loss actually uses**, in
+     `CategoricalCrossEntropyLogits`: after subtracting the max, `exp` is only
+     needed for `x <= 0`; the log is only needed for a sum in `[1, n_classes]`.
+     Add `exp_nonpos_f32` (no NaN/overflow/sign branches, clamp at -87) and
+     `log_ge1_f32` (reduce by exponent bits, one short polynomial). Keep the
+     general `exp_f32`/`log_f32` for other callers and tests.
+  2. Round with `vcvtn`/`vrintn` instead of the `x < 0 ? -0.5f : 0.5f` branch,
+     use Horner with `fmaf`, and build `2^n` by integer add into the exponent.
+  3. If still above target: port pico_float's table-based `expf`/`logf`
+     (BSD-3, in `pico_float`) into `smlp::` as tagged code. Higher effort
+     because the SDK versions are assembly; only do this if 1 and 2 miss.
+- Re-baseline the golden loss/accuracy once, as Step 0 did, and record that
+  commit hash.
+
+**3. Expected saving.** About 1.2-1.6k cycles/sample from 2d (up to about
+0.4 s per session, recovering core1/naive to 42.5 s). The rest of the step
+produces no saving but should decide Step 1: it identifies where core 0's
+extra 2.2k cycles/sample comes from, and whether the layer-1 forward +1024
+penalty is bus contention.
+
+**4. Independence impact and mitigation.**
+- Counters read `busctrl_hw` (an APB peripheral, not RAM) and only run in
+  profile builds; no change to benchmark/test builds' memory layout. Keep
+  every new probe/printing function in the profile TU (`MEML_RUN_PROFILE`
+  only) so none lands in the pinned banks of the benchmark build.
+- The probe on core 1 (2a) must keep core 0 idle in WFE, otherwise the
+  "dormant" condition is violated and the numbers are not comparable. Report
+  that the idle core issued no SRAM accesses by also printing core-0-side
+  `SRAMx_ACCESS` totals for a sample window where nothing is expected to run.
+- New `expf`/`logf` specialisations are `smlp::`, `SMLP_CODE_ATTR`: the
+  existing prefix and callee-closure checks cover them. Confirm the callee
+  check still passes on `build-core1` after 2d.
+- Counter results are **read-only evidence**: Step 0.5 changes no placement.
+
+**5. Further testing.**
+- `FastMathTest`: ULP/relative-error bound vs `std::exp`/`std::log` over the
+  restricted domains, including `x = 0`, `x = -87`, `x = -100` (must give 0,
+  not denormal garbage), sum = 1 and sum = `n_classes`; a unit test that
+  `CategoricalCrossEntropyLogits` loss and gradient stay within the previous
+  tolerance over a full-range logit sweep.
+- Self-test of the script parsers (`run_self_test`) for the new stage names,
+  `contention_results.csv` rows and `kind=loop` rows.
+- Reproducibility: run the profile twice per build and require cycle counts
+  to agree within 0.1% and contested counts within 1%, or the counters are
+  not usable.
+- **Acceptance run:** full benchmark for core0/core1/naive. Pass if
+  `compute_loss <= 1,000` and the three dormant times are within the
+  expected spread; then record the decision below.
+
+**Decision gate for Step 1** (write the outcome into this file before
+starting Step 1):
+
+| Observation | Meaning | Go to |
+|---|---|---|
+| `layer1.forward` contested count (SRAM0-3) is higher in naive (slow) than in core0 (fast) by about the same order as the extra 1024 cycles | Bank contention confirmed; the counters also say *which* bank, i.e. which stream collides with fetch | Step 1b (scratch banks), skip 1a |
+| Contested counts equal, cycles differ | Not bus arbitration. Likely fetch alignment / prefetch / branch behaviour | Step 1a only; revise 1.6 |
+| Counts differ but not in the code bank (e.g. data vs data) | Data layout collision, not code | Step 1b is the wrong fix; move or pad the hot arrays instead; revise Step 1 |
+| `train.epoch_minus_eval_per_sample` differs core0 vs core1 by about 2.2k while the per-layer stages do not | The slowdown is in code only the production path has (inlined backward in `Train`, RMSProp lambda) | Look at the `kind=loop` rows for `Train`; apply 1a to `Train` itself; the kernels to move in 1b include the inlined loops, so Steps 2-4 should land first or the backward must be split into out-of-line kernels |
+| Counts are all near zero everywhere | The counters are not seeing the CPU traffic (wrong events/passes) or the hypothesis is false | Re-check event selection against the datasheet before proceeding |
+
+**Step 0.5 results and decision (uncommitted working tree on top of `070f5aa`;
+profile builds, core 1 for the core1 build, two runs each, cycle counts identical
+between runs, counter passes within 0.1% of the counter-free reference):**
+
+| | core0 | core1 | naive |
+|---|---|---|---|
+| per-layer fwd+loss (cycles/sample) | 41,018 | 41,156 | 41,018 |
+| per-layer full pass | 152,826 | 154,592 | 152,827 |
+| `train.eval_pass` / sample (production) | 42,517 | 40,570 | 42,534 |
+| `train.epoch_minus_eval_per_sample` (production) | 159,465 | 157,512 | 159,479 |
+| harness estimate (full pass + per-batch) | 157,228 | 158,994 | 157,229 |
+| **unexplained (production - harness)** | **+2,237** | 0 | **+2,250** |
+| production contested accesses / epoch | 49.2M (banks 0-3) | 34.2M (banks 4-7) | 118.2M (banks 0-3) |
+| `layer1.forward` per-layer cycles | 12,992 | 13,016 | 12,992 |
+| `layer1.forward` contested accesses | 1,064 | 0 | 1,064 |
+| `compute_loss` per-layer cycles | 1,137 | 1,137 | 1,137 |
+
+- Row 4 of the gate matches: production is about 2.2k/sample slower than the
+  harness on core0 and naive, but not on core 1, and the per-layer stages do not
+  show it. The excess is in the **eval/forward half** (`train.eval_pass` is
+  1.9k/sample slower on core 0), i.e. code or data only the production path has
+  (the `State` ping-pong buffers, `GetOutput`, the argmax loop), not the layer
+  kernels. Contested counts are consistent with it (core 0: 6.4% of cycles,
+  core 1: 4.5%, naive: 15%) but the per-layer harness cannot localise it.
+- Row 2 matches for the `layer1.forward` +1,024 (now present in **all three**
+  builds, 11,960 -> 12,992/13,016): core1 has **zero** contested accesses there
+  yet the same slowdown, so that penalty is not bus arbitration. Treat it as
+  fetch/alignment: **go to Step 1a first**. Step 1b (scratch banks) is not
+  supported by this evidence for the layer kernels; reconsider after 1a and
+  after localising the production-path excess (apply 1a to `Train`, read the
+  `kind=loop` rows of `MLPOpticalRecognition::Train` in `placement_results.csv`).
+- The probe core's own `compute_loss` figure moved between 845 and 1,137 cycles
+  when unrelated code was added ahead of it (no source change to the loss), and
+  an isolated call measures 752 cycles. So the 2d exit criterion (<= 1,000) is
+  met by the kernel (752) but not by the in-harness figure of the current
+  layout (1,137); that residual is the same placement sensitivity as above and
+  is expected to be resolved by Step 1a.
+- Not done: the full benchmark acceptance run and the golden re-baseline of
+  loss/accuracy for the new `expf`/`logf` (needs a clean tree and ~15 min per
+  config).
+
+---
+
 ### Step 1 - Test the bank-collision hypothesis and, if true, fix it
 
-**1. Rationale.** See 1.6. If it holds, a large part of the observed
+**Prerequisite:** Step 0.5 and its decision gate. Which of 1a/1b to run is
+decided there, not here.
+
+**1. Rationale.** See 1.6 and 1.8. If it holds, a large part of the observed
 cycles/instruction (especially in backward) and all of the build-to-build
 variance is avoidable, and Steps 2-4 become measurable. If it does not hold,
 we lose about half a day and learn that alignment/placement noise has another
@@ -528,8 +768,11 @@ formula (relative error bound), plus the convergence regression from Step 5.
    (`build-core0`, `build-core1`, `build-naive`); the POST_BUILD validator must
    pass, including the Step-0 callee check.
 2. `arm-none-eabi-nm` spot-check any new symbol address is in the right window.
-3. Run the profile build for all three; compare per-stage cycles and the
-   placement columns before benchmarking.
+3. Run the profile build for all three (from Step 0.5 on: per-layer stages,
+   the production-path probe `train.*`, and the contention counters); compare
+   per-stage cycles and the placement columns before benchmarking. A step is
+   not accepted on per-layer rows alone: the production-path rows must move
+   the same way.
 4. Run the unit suite (`RUN_TESTS_OR_BENCHMARKS=tests`).
 5. Only then run the full benchmark and commit the CSV rows with the commit
    hash (the script requires a clean tree).

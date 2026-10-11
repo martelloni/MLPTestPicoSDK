@@ -65,6 +65,18 @@ It catches libc/libm helpers and compiler libcalls (`memcpy`, `memset`,
   shared with core 0's own code, so they must not be redirected either.
 - The check needs `--objdump`; CMake passes `${CMAKE_OBJDUMP}`.
 
+## Profile build (`RUN_TESTS_OR_BENCHMARKS=profile`)
+
+Runs on the core the MLP is pinned to (core 1 for `MEML_MLP_RUNS_ON_CORE=1`),
+with the other core as a WFE-blocked counter poller. Beyond per-layer cycles
+it times the real `MLPOpticalRecognition::Train` (`train.*` rows), reads the
+RP2350 bus-contention counters (`contention` lines, three passes that must
+reproduce the counter-free cycles within 0.1%), and prints placement. Keep all
+probe code in `tests/ProfileForwardBackward.cpp`. `RunAndSaveBenchmarks.py`
+writes `profiling_results.csv`, `placement_results.csv` (data, code and
+`kind=loop` rows) and `contention_results.csv`. The profile build is validated
+like a benchmark build (symbol placement, entry points, callee closure).
+
 ## Untagged code needs its own check
 
 Most MLP code is placed via `SMLP_CODE_ATTR` and caught by

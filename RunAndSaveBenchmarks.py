@@ -72,7 +72,7 @@ DEFAULT_SERIAL_PORT = "/dev/tty.usbmodem2101"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_PICOTOOL = Path.home() / ".pico-sdk" / "picotool" / "2.3.0" / "picotool" / "picotool"
 DEFAULT_RUN_TIMEOUT_S = 25 * 60  # each run takes ~15 min; leave headroom
-DEFAULT_PROFILE_TIMEOUT_S = 5 * 60  # 100 iterations; just needs headroom past the two key-press gates
+DEFAULT_PROFILE_TIMEOUT_S = 10 * 60  # per-layer passes + 3 production epochs + 3 counter epochs, ~2 min; headroom on top
 PORT_REAPPEAR_TIMEOUT_S = 30.0
 HEARTBEAT_INTERVAL_S = 30.0
 KEY_RESEND_INTERVAL_S = 2.0
@@ -82,6 +82,7 @@ LOG_DIR = RESULTS_DIR / "logs"
 CSV_PATH = RESULTS_DIR / "ram_independence_results.csv"
 PROFILE_CSV_PATH = RESULTS_DIR / "profiling_results.csv"
 PLACEMENT_CSV_PATH = RESULTS_DIR / "placement_results.csv"
+CONTENTION_CSV_PATH = RESULTS_DIR / "contention_results.csv"
 
 # Mirrors main.cpp's kEpochsPerSession, which is not itself printed over UART.
 EXPECTED_EPOCHS_PER_SESSION = 10
@@ -553,6 +554,7 @@ PLACEMENT_CSV_FIELDS = [
     "address",
     "addr_mod16",
     "bank",
+    "size_bytes",
     "log_file",
 ]
 
@@ -564,7 +566,9 @@ RE_PLACEMENT_DATA = re.compile(r"^\s*placement data (\S+)\s+addr=0x([0-9a-fA-F]+
 # taken from the ELF symbol table instead. Demangled-name match.
 RE_HOT_CODE_SYMBOL = re.compile(
     r"StaticLayer<.*>::(forward|AccumulateGradients|ApplyAccumulatedGradients|"
-    r"GetGradSumSquared|InitGradientAccumulators)\(|RunForwardBackwardProfile\(\)$"
+    r"GetGradSumSquared|InitGradientAccumulators)\(|"
+    r"MLPOpticalRecognition::(Train|Initialise)\(|for_each_layer<|"
+    r"test::profile::.*(RunLayerPass|RunBatchStages|ProbeBody|MeasureTrain|RunTrainOnce)\("
 )
 
 
@@ -589,20 +593,23 @@ def parse_placement_transcript(text: str, build_config: str, timestamp: str, git
         rows.append(dict(
             timestamp=timestamp, git_commit=git_commit, build_config=build_config,
             kind="data", name=name, address=f"0x{address:08x}", addr_mod16=mod16,
-            bank=bank_of(address), log_file=log_file,
+            bank=bank_of(address), size_bytes="", log_file=log_file,
         ))
     return rows
 
 
-def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
-    """Address / address%16 of every hot-kernel code symbol in the ELF."""
+def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: str, git_commit: str, log_file: str,
+                            objdump: str | None = None) -> list[dict]:
+    """Address / address%16 / size of every hot-kernel code symbol in the ELF
+    (kind=code), plus, when `objdump` is given, the head address, length and
+    addr%16 of every inner loop inside those symbols (kind=loop)."""
     out = subprocess.run([nm, "-C", "-S", str(elf)], capture_output=True, text=True, check=True).stdout
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 3)
         if len(parts) < 4:  # symbols without a size column (-S) are not code we care about
             continue
-        addr_s, _size, kind, name = parts
+        addr_s, size_s, kind, name = parts
         if kind not in ("T", "t", "W", "w"):
             continue
         if not RE_HOT_CODE_SYMBOL.search(name):
@@ -611,22 +618,137 @@ def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: st
         rows.append(dict(
             timestamp=timestamp, git_commit=git_commit, build_config=build_config,
             kind="code", name=name, address=f"0x{address:08x}", addr_mod16=str(address % 16),
-            bank=bank_of(address), log_file=log_file,
+            bank=bank_of(address), size_bytes=str(int(size_s, 16)), log_file=log_file,
         ))
+    if objdump:
+        dis = subprocess.run([objdump, "-d", "-C", str(elf)], capture_output=True, text=True, check=True).stdout
+        for name, head, length in find_loops(dis, RE_HOT_CODE_SYMBOL):
+            rows.append(dict(
+                timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+                kind="loop", name=f"{name} loop@0x{head:08x}", address=f"0x{head:08x}",
+                addr_mod16=str(head % 16), bank=bank_of(head), size_bytes=str(length), log_file=log_file,
+            ))
     return rows
 
 
-def find_nm(build_dir: Path) -> str:
+RE_DIS_FUNC = re.compile(r"^([0-9a-fA-F]+) <(.+)>:$")
+RE_DIS_INSN = re.compile(r"^\s*([0-9a-fA-F]+):\t([0-9a-fA-F ]+)\t(\S+)(?:\s+(.*))?$")
+RE_DIS_BRANCH = re.compile(r"^(?:b|cbz|cbnz)(?:eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)?(?:\.[nw])?$")
+
+
+def find_loops(disassembly: str, wanted) -> list[tuple[str, int, int]]:
+    """(symbol, head address, length in bytes) for every backward branch whose
+    target lies inside the same symbol, for symbols whose demangled name
+    matches `wanted`. A loop head targeted by several backward branches is
+    reported once, with the longest extent. `bl` calls are not loops."""
+    loops: dict[tuple[str, int], int] = {}
+    func = None
+    func_start = 0
+    for line in disassembly.splitlines():
+        h = RE_DIS_FUNC.match(line)
+        if h:
+            func_start = int(h.group(1), 16)
+            func = h.group(2) if wanted.search(h.group(2)) else None
+            continue
+        if func is None:
+            continue
+        m = RE_DIS_INSN.match(line)
+        if not m or not RE_DIS_BRANCH.match(m.group(3)):
+            continue
+        addr = int(m.group(1), 16)
+        size = len(m.group(2).replace(" ", "")) // 2
+        t = re.match(r"^([0-9a-fA-F]+) <", (m.group(4) or "").strip())
+        if not t:
+            continue
+        target = int(t.group(1), 16)
+        if func_start <= target <= addr:
+            key = (func, target)
+            loops[key] = max(loops.get(key, 0), addr + size - target)
+    return [(f, head, length) for (f, head), length in sorted(loops.items(), key=lambda kv: kv[0][1])]
+
+
+def find_tool(build_dir: Path, cache_var: str, fallback: str) -> str:
     cache = build_dir / "CMakeCache.txt"
     if cache.exists():
-        m = re.search(r"^CMAKE_NM:FILEPATH=(.+)$", cache.read_text(), re.M)
+        m = re.search(rf"^{cache_var}:FILEPATH=(.+)$", cache.read_text(), re.M)
         if m and Path(m.group(1)).exists():
             return m.group(1)
-    return shutil.which("arm-none-eabi-nm") or "arm-none-eabi-nm"
+    return shutil.which(fallback) or fallback
+
+
+def find_nm(build_dir: Path) -> str:
+    return find_tool(build_dir, "CMAKE_NM", "arm-none-eabi-nm")
+
+
+CONTENTION_CSV_FIELDS = [
+    "timestamp",
+    "git_commit",
+    "build_config",
+    "stage",
+    "sram_bank",
+    "contested_avg",
+    "access_avg",
+    "valid",
+    "log_file",
+]
+
+# tests/ProfileForwardBackward.cpp's PrintContention():
+#   "  contention stage=<s> bank=SRAM<n> contested=<v|-> access=<v|->"
+RE_CONTENTION = re.compile(
+    r"^\s*contention stage=(\S+) bank=SRAM(\d+) contested=([0-9.]+|-) access=([0-9.]+|-)\s*$"
+)
+# "  contention pass=N full_pass_cycles=X reference=Y valid=yes|NO" -- a pass whose
+# full-pass cycles drift from the counter-free reference by >0.1% means the
+# counter reads perturbed the measurement, so that pass's rows are not usable.
+RE_CONTENTION_PASS = re.compile(r"^\s*contention pass=(\d+) .* valid=(yes|NO)\s*$")
+# Which pass covers which bank in the per-layer harness (see kPassSel).
+_PASS_OF_BANK = {0: 1, 1: 1, 2: 1, 3: 1, 4: 2, 5: 2, 6: 2, 7: 2, 8: 3, 9: 3}
+PER_LAYER_STAGES = {
+    "layer0.forward", "layer1.forward", "layer2.forward", "compute_loss",
+    "layer2.AccumulateGradients", "layer1.AccumulateGradients", "layer0.AccumulateGradients",
+}
+
+
+def parse_contention_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    pass_valid = {}
+    merged: dict[tuple[str, int], dict] = {}
+    for line in text.splitlines():
+        pm = RE_CONTENTION_PASS.match(line)
+        if pm:
+            pass_valid[int(pm.group(1))] = pm.group(2) == "yes"
+            continue
+        m = RE_CONTENTION.match(line)
+        if not m:
+            continue
+        stage, bank, contested, access = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+        row = merged.setdefault((stage, bank), dict(
+            timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+            stage=stage, sram_bank=str(bank), contested_avg="", access_avg="", valid="", log_file=log_file))
+        if contested != "-":
+            row["contested_avg"] = contested
+        if access != "-":
+            row["access_avg"] = access
+    rows = list(merged.values())
+    for row in rows:
+        if row["stage"] in PER_LAYER_STAGES:
+            ok = pass_valid.get(_PASS_OF_BANK[int(row["sram_bank"])], True)
+            row["valid"] = "yes" if ok else "NO"
+    return rows
+
+
+def append_contention_rows_to_csv(rows: list) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    csv_is_new = not CONTENTION_CSV_PATH.exists()
+    with open(CONTENTION_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
+        writer = csv.DictWriter(csv_f, fieldnames=CONTENTION_CSV_FIELDS)
+        if csv_is_new:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def append_placement_rows_to_csv(rows: list) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
+    migrate_csv_header(PLACEMENT_CSV_PATH, PLACEMENT_CSV_FIELDS)
     csv_is_new = not PLACEMENT_CSV_PATH.exists()
     with open(PLACEMENT_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
         writer = csv.DictWriter(csv_f, fieldnames=PLACEMENT_CSV_FIELDS)
@@ -706,6 +828,21 @@ Per-batch stages (once per 128 samples; 20 iterations):
   batch.rmsprop total          avg= 142000.0 cycles   max=  142030 cycles
   batch total                  avg= 144400.5 cycles   max=  144450 cycles
   batch total per sample       avg=    1128.0 cycles   max=    1128 cycles
+Bus contention per sample (per-layer harness; counters outside the timed bracket):
+  contention pass=1 full_pass_cycles=4230.0 reference=4230.3 valid=yes
+  contention stage=layer1.forward bank=SRAM0 contested=0.0 access=-
+  contention stage=layer1.forward bank=SRAM3 contested=12.5 access=-
+  contention pass=2 full_pass_cycles=4300.0 reference=4230.3 valid=NO
+  contention stage=layer1.forward bank=SRAM4 contested=25.0 access=-
+  contention pass=3 full_pass_cycles=4230.1 reference=4230.3 valid=yes
+  contention stage=layer1.forward bank=SRAM0 contested=- access=77.0
+  contention stage=layer1.forward bank=SRAM8 contested=0.0 access=-
+Production path (MLPOpticalRecognition::Train on this core, min of 3):
+  train.eval_pass              avg=154881639.0 cycles   max=154917299 cycles
+  train.epoch                  avg=757294578.0 cycles   max=757294848 cycles
+  train.epoch_minus_eval_per_sample avg= 157575.0 cycles   max=  157575 cycles
+Bus contention, production path (totals over Initialise + Train(1); polled from the other core):
+  contention stage=train.epoch bank=SRAM4 contested=12466738.0 access=-
 Placement (net and kernel code addresses; code addresses are added by
 RunAndSaveBenchmarks.py from the ELF symbol table):
   placement data net                          addr=0x20008a30 mod16=0
@@ -741,15 +878,45 @@ def run_self_test() -> None:
     profile_rows = parse_profile_transcript(
         SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
     )
-    assert len(profile_rows) == 18
+    assert len(profile_rows) == 21
     assert profile_rows[0]["stage"] == "layer0.forward"
     assert profile_rows[0]["avg_cycles"] == "1234.5"
     assert profile_rows[0]["max_cycles"] == "1300"
     assert profile_rows[0]["iterations"] == "100"
     assert profile_rows[9]["stage"] == "full pass"
     assert profile_rows[9]["max_cycles"] == "4470"
-    assert profile_rows[-1]["stage"] == "batch total per sample"
-    assert profile_rows[-3]["stage"] == "batch.rmsprop total"
+    assert profile_rows[17]["stage"] == "batch total per sample"
+    assert profile_rows[15]["stage"] == "batch.rmsprop total"
+    assert profile_rows[-1]["stage"] == "train.epoch_minus_eval_per_sample"
+    assert profile_rows[-3]["stage"] == "train.eval_pass"
+    assert profile_rows[-2]["avg_cycles"] == "757294578.0"
+
+    contention_rows = parse_contention_transcript(
+        SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
+    )
+    by_key = {(r["stage"], r["sram_bank"]): r for r in contention_rows}
+    assert by_key[("layer1.forward", "3")]["contested_avg"] == "12.5"
+    assert by_key[("layer1.forward", "3")]["valid"] == "yes"
+    assert by_key[("layer1.forward", "4")]["valid"] == "NO"  # pass 2 drifted
+    assert by_key[("layer1.forward", "0")]["contested_avg"] == "0.0"  # pass 1 contested ...
+    assert by_key[("layer1.forward", "0")]["access_avg"] == "77.0"    # ... merged with pass 3 access
+    assert by_key[("train.epoch", "4")]["contested_avg"] == "12466738.0"
+    assert by_key[("train.epoch", "4")]["valid"] == ""
+
+    sample_dis = """\
+20000000 <test::profile::(anonymous namespace)::RunLayerPass(int, LayerPass&)>:
+20000000:\tb510      \tpush\t{r4, lr}
+20000002:\tbf00      \tnop
+20000004:\t3001      \tadds\tr0, #1
+20000006:\t2864      \tcmp\tr0, #100
+20000008:\td1fc      \tbne.n\t20000004 <test::profile::(anonymous namespace)::RunLayerPass(int, LayerPass&)+0x4>
+2000000a:\tf000 f805 \tbl\t20000018 <helper>
+2000000e:\te7f8      \tb.n\t20000002 <test::profile::(anonymous namespace)::RunLayerPass(int, LayerPass&)+0x2>
+20000018 <helper>:
+20000018:\t4770      \tbx\tlr
+"""
+    loops = find_loops(sample_dis, RE_HOT_CODE_SYMBOL)
+    assert [(h, n) for _, h, n in loops] == [(0x20000002, 14), (0x20000004, 6)], loops
 
     placement_rows = parse_placement_transcript(
         SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
@@ -759,7 +926,7 @@ def run_self_test() -> None:
     assert placement_rows[1]["address"] == "0x20008a34"
     assert placement_rows[1]["bank"] == "core0-bank"
 
-    log("Self-test OK: parser correctly extracts pinned, naive, and profile transcripts.")
+    log("Self-test OK: parser correctly extracts pinned, naive, profile, placement, contention and loop data.")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -911,8 +1078,16 @@ def main(argv=None) -> int:
             profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
         placement_rows += elf_code_placement_rows(
             profile_cfg.elf_path, find_nm(profile_cfg.build_dir), profile_cfg.name,
-            profile_timestamp, git_commit, profile_log_rel)
+            profile_timestamp, git_commit, profile_log_rel, objdump=find_tool(profile_cfg.build_dir, "CMAKE_OBJDUMP", "arm-none-eabi-objdump"))
         append_placement_rows_to_csv(placement_rows)
+        contention_rows = parse_contention_transcript(
+            profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
+        append_contention_rows_to_csv(contention_rows)
+        invalid = [r for r in contention_rows if r["valid"] == "NO"]
+        if invalid:
+            log(f"WARNING: {len(invalid)} per-layer contention row(s) came from a pass whose cycle count drifted "
+                f">0.1% from the counter-free reference; discard them and re-run")
+        log(f"Saved {len(contention_rows)} contention row(s) to {CONTENTION_CSV_PATH}")
         log(f"Saved {len(placement_rows)} placement row(s) for {profile_cfg.name} to {PLACEMENT_CSV_PATH}")
         log(f"Saved {len(profile_rows)} row(s) for {profile_cfg.name} to {PROFILE_CSV_PATH}; raw log at {profile_log_path}")
 
@@ -922,6 +1097,7 @@ def main(argv=None) -> int:
     if not args.skip_profile:
         result_paths.append(str(PROFILE_CSV_PATH))
         result_paths.append(str(PLACEMENT_CSV_PATH))
+        result_paths.append(str(CONTENTION_CSV_PATH))
     log(f"\nAll done. Results in {' and '.join(result_paths)}")
     return 0
 

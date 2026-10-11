@@ -223,7 +223,7 @@ int main()
     while (getchar_timeout_us((int64_t)-1) == PICO_ERROR_TIMEOUT) {
         tight_loop_contents();
     }
-    test::profile::RunForwardBackwardProfile();
+    test::profile::RunProfiles();
 #endif
 
     while (true) {
