@@ -553,18 +553,21 @@ PLACEMENT_CSV_FIELDS = [
     "timestamp",
     "git_commit",
     "build_config",
+    "binary",           # profile / benchmark: which ELF the row describes (Step 0.5b)
     "kind",
     "name",
     "address",
     "addr_mod16",
     "bank",
     "size_bytes",
+    "instance_offset",  # data rows: offset from the production instance (g_prod)
     "log_file",
 ]
 
 # tests/ProfileForwardBackward.cpp's PrintPlacement():
-#   "  placement data <name> addr=0x20001234 mod16=4"
-RE_PLACEMENT_DATA = re.compile(r"^\s*placement data (\S+)\s+addr=0x([0-9a-fA-F]+) mod16=(\d+)\s*$")
+#   "  placement data <name> addr=0x20001234 mod16=4 off=29000"   (off=- outside g_prod)
+RE_PLACEMENT_DATA = re.compile(
+    r"^\s*placement data (\S+)\s+addr=0x([0-9a-fA-F]+) mod16=(\d+)(?: off=(\d+|-))?\s*$")
 # Hot code whose address the firmware cannot report reliably (the compiler may
 # emit out-of-line `.constprop` clones, or inline the kernel into the caller):
 # taken from the ELF symbol table instead. Demangled-name match.
@@ -592,18 +595,19 @@ def parse_placement_transcript(text: str, build_config: str, timestamp: str, git
         m = RE_PLACEMENT_DATA.match(line)
         if not m:
             continue
-        name, addr, mod16 = m.groups()
+        name, addr, mod16, off = m.groups()
         address = int(addr, 16)
         rows.append(dict(
-            timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+            timestamp=timestamp, git_commit=git_commit, build_config=build_config, binary="profile",
             kind="data", name=name, address=f"0x{address:08x}", addr_mod16=mod16,
-            bank=bank_of(address), size_bytes="", log_file=log_file,
+            bank=bank_of(address), size_bytes="", instance_offset="" if off in (None, "-") else off,
+            log_file=log_file,
         ))
     return rows
 
 
 def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: str, git_commit: str, log_file: str,
-                            objdump: str | None = None) -> list[dict]:
+                            objdump: str | None = None, binary: str = "profile") -> list[dict]:
     """Address / address%16 / size of every hot-kernel code symbol in the ELF
     (kind=code), plus, when `objdump` is given, the head address, length and
     addr%16 of every inner loop inside those symbols (kind=loop)."""
@@ -620,7 +624,7 @@ def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: st
             continue
         address = int(addr_s, 16)
         rows.append(dict(
-            timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+            timestamp=timestamp, git_commit=git_commit, build_config=build_config, binary=binary,
             kind="code", name=name, address=f"0x{address:08x}", addr_mod16=str(address % 16),
             bank=bank_of(address), size_bytes=str(int(size_s, 16)), log_file=log_file,
         ))
@@ -628,7 +632,7 @@ def elf_code_placement_rows(elf: Path, nm: str, build_config: str, timestamp: st
         dis = subprocess.run([objdump, "-d", "-C", str(elf)], capture_output=True, text=True, check=True).stdout
         for name, head, length in find_loops(dis, RE_HOT_CODE_SYMBOL):
             rows.append(dict(
-                timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+                timestamp=timestamp, git_commit=git_commit, build_config=build_config, binary=binary,
                 kind="loop", name=f"{name} loop@0x{head:08x}", address=f"0x{head:08x}",
                 addr_mod16=str(head % 16), bank=bank_of(head), size_bytes=str(length), log_file=log_file,
             ))
@@ -684,6 +688,130 @@ def find_nm(build_dir: Path) -> str:
     return find_tool(build_dir, "CMAKE_NM", "arm-none-eabi-nm")
 
 
+# ── Step 0.5b: static bank-phase analysis of the ELFs ─────────────────────────────
+# The RP2350 stripes a bank group by address bits [3:2], so what matters for a hot
+# loop is (loop head - stream address) mod 16 (plan section 1.5). Everything here is
+# computed from the ELF symbol table and the committed stream-offset table, without
+# running the device, for the benchmark ELF and the profile ELF alike.
+STREAM_OFFSETS_CSV_PATH = RESULTS_DIR / "stream_offsets.csv"
+STREAM_OFFSETS_FIELDS = ["name", "offset"]
+
+# (NIn, NOut) of each StaticLayer instantiation of MLPOpticalRecognition::Net.
+LAYER_OF_SHAPE = {(64, 64): 0, (64, 32): 1, (32, 10): 2}
+RE_PHASE_KERNEL = re.compile(
+    r"StaticLayer<float, (\d+)u, (\d+)u, .*>::(forward|AccumulateGradients|ApplyAccumulatedGradients)\(")
+# Loops shorter than this are copy/zero/prologue loops, not the streaming kernels.
+MIN_PHASE_LOOP_BYTES = 16
+
+
+def kernel_streams(kernel: str, k: int) -> list[str]:
+    """Names (as in the profile's placement lines) of the streams one kernel of
+    layer k reads or writes in its hot loops, in the roles StaticMLP gives them:
+    delta_out of layer I is `(I & 1) ? m_bp1 : m_bp0`, its error input is the
+    delta of layer I+1 (or m_deriv for the last layer); forward ping-pongs m_buf_a/b."""
+    w, gacc = f"layer{k}.m_weights", f"layer{k}.m_grad_accum"
+    cached = f"layer{k}.m_cached_input"
+    if kernel == "forward":
+        extra = {1: ["net.m_buf_a"], 2: ["net.m_buf_b"]}.get(k, [])
+        return [w, cached] + extra
+    if kernel == "AccumulateGradients":
+        delta_out = "net.m_bp1" if k & 1 else "net.m_bp0"
+        err = "net.m_deriv" if k == 2 else ("net.m_bp1" if (k + 1) & 1 else "net.m_bp0")
+        return [w, gacc, cached, delta_out, err]
+    return [w, gacc, f"layer{k}.m_sq_grad_avg"]  # ApplyAccumulatedGradients
+
+
+def parse_stream_offsets(text: str) -> dict:
+    """{stream name: offset from the production instance} from a profile transcript."""
+    return {r["name"]: int(r["instance_offset"])
+            for r in parse_placement_transcript(text, "", "", "", "") if r["instance_offset"] != ""}
+
+
+def write_stream_offsets(offsets: dict) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    with open(STREAM_OFFSETS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=STREAM_OFFSETS_FIELDS)
+        w.writeheader()
+        for name, off in offsets.items():
+            w.writerow(dict(name=name, offset=off))
+
+
+def read_stream_offsets() -> dict:
+    if not STREAM_OFFSETS_CSV_PATH.exists():
+        return {}
+    with open(STREAM_OFFSETS_CSV_PATH, newline="", encoding="utf-8") as f:
+        return {r["name"]: int(r["offset"]) for r in csv.DictReader(f)}
+
+
+def instance_symbol_address(nm_output: str, binary: str) -> tuple[str, int]:
+    """(name, address) of the production MLPOpticalRecognition instance in an
+    `nm -C -S` listing: `g_prod` for the profile ELF, `<test>::mlp_experiment_`
+    for the benchmark ELF. Exactly one must match."""
+    want = (re.compile(r"^test::profile::\(anonymous namespace\)::g_prod$") if binary == "profile"
+            else re.compile(r"^test::\w+::mlp_experiment_$"))
+    found = []
+    for line in nm_output.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and want.match(parts[3]):
+            found.append((parts[3], int(parts[0], 16)))
+    if len(found) != 1:
+        raise BenchmarkError(f"expected exactly one production instance symbol in the {binary} ELF, found {found}")
+    return found[0]
+
+
+def phase_rows(binary: str, build_config: str, instance: tuple[str, int], offsets: dict,
+               loops: list, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    """The Step 0.5b rows: one `instance` row (its address mod 16 must be the same
+    in every build for the phases to be comparable) and, for every hot loop of
+    every StaticLayer kernel and every stream that kernel touches,
+    `rel_phase = (loop head - stream) mod 16`. `loops` is find_loops() output."""
+    sym, base = instance
+    base_row = dict(timestamp=timestamp, git_commit=git_commit, build_config=build_config, binary=binary,
+                    log_file=log_file)
+    rows = [dict(base_row, kind="instance", name=sym, address=f"0x{base:08x}", addr_mod16=str(base % 16),
+                 bank=bank_of(base), size_bytes="", instance_offset="0")]
+    for func, head, length in loops:
+        m = RE_PHASE_KERNEL.search(func)
+        if not m or length < MIN_PHASE_LOOP_BYTES:
+            continue
+        k = LAYER_OF_SHAPE.get((int(m.group(1)), int(m.group(2))))
+        if k is None:
+            continue
+        kernel = m.group(3)
+        for stream in kernel_streams(kernel, k):
+            if stream not in offsets:
+                raise BenchmarkError(f"stream '{stream}' missing from the offset table; re-run a profile build")
+            addr = base + offsets[stream]
+            rows.append(dict(base_row, kind="rel_phase",
+                             name=f"layer{k}.{kernel} loop@0x{head:08x} - {stream}",
+                             address=f"0x{addr:08x}", addr_mod16=str((head - addr) % 16), bank=bank_of(addr),
+                             size_bytes=str(length), instance_offset=str(offsets[stream])))
+    return rows
+
+
+def static_phase_rows(cfg: "BuildConfig", binary: str, offsets: dict, timestamp: str, git_commit: str,
+                      log_file: str) -> list[dict]:
+    nm = find_nm(cfg.build_dir)
+    objdump = find_tool(cfg.build_dir, "CMAKE_OBJDUMP", "arm-none-eabi-objdump")
+    nm_out = subprocess.run([nm, "-C", "-S", str(cfg.elf_path)], capture_output=True, text=True, check=True).stdout
+    dis = subprocess.run([objdump, "-d", "-C", str(cfg.elf_path)], capture_output=True, text=True, check=True).stdout
+    return phase_rows(binary, cfg.name, instance_symbol_address(nm_out, binary), offsets,
+                      find_loops(dis, RE_PHASE_KERNEL), timestamp, git_commit, log_file)
+
+
+def check_profile_addresses(instance_address: int, placement_rows: list) -> bool:
+    """Cross-check (Step 0.5b): in the profile ELF, instance symbol + printed
+    offset must equal the runtime address the profile printed for every stream."""
+    ok = True
+    for r in placement_rows:
+        if r["kind"] == "data" and r.get("instance_offset", "") != "":
+            want = instance_address + int(r["instance_offset"])
+            if int(r["address"], 16) != want:
+                ok = False
+                log(f"ADDRESS MISMATCH {r['name']}: printed {r['address']} but ELF instance + offset = 0x{want:08x}")
+    return ok
+
+
 CONTENTION_CSV_FIELDS = [
     "timestamp",
     "git_commit",
@@ -720,14 +848,39 @@ RE_XIP = re.compile(r"^\s*xip stage=(\S+) event=(\S+) per_call=([0-9.]+)\s*$")
 TRAIN_STAGES = ("train.epoch", "train.eval_pass")
 
 
+NUM_EXAMPLES = 3823  # dataset::kNumExamples: Train(1) minus Train(0) is one pass over this many samples
+
+
+def bank_of_stack(sp: int) -> str:
+    """Which SRAM bank group holds the probe's stack: 'sram8', 'sram9', or the striped group."""
+    if 0x20080000 <= sp < 0x20081000:
+        return "sram8"
+    if 0x20081000 <= sp < 0x20082000:
+        return "sram9"
+    if 0x20000000 <= sp < 0x20040000:
+        return "group0-3"
+    if 0x20040000 <= sp < 0x20080000:
+        return "group4-7"
+    return "other"
+
+
 def parse_contention_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str,
-                                probe_on_core1: bool = False, cycles_by_stage: dict | None = None) -> list[dict]:
+                                probe_on_core1: bool = False, cycles_by_stage: dict | None = None,
+                                stack_pointer: int | None = None) -> list[dict]:
     """Raw per-bank rows, plus (Step 0c) the arithmetic a reader should never
     have to do: for every stage with all of banks 0-7, a `group` row (sum of
     contested counts over the four banks of the group the probe core's data
     lives in: 0-3, or 4-7 when the probe core is core 1) and an
     `other_group_total` row (the other four). Train stages also get
-    contested_pct_of_cycles = group / cycles, from `cycles_by_stage`."""
+    contested_pct_of_cycles = group / cycles, from `cycles_by_stage`.
+
+    Step 0.5: the `group` / `other_group_total` rows also carry the access totals
+    (access_avg) when all eight banks have them; `poller_access` (train.epoch) is the
+    other core's own SRAM traffic (bank 0 for core1 builds, bank 4 otherwise);
+    `stack_bank_*` rows give the contested/access counts of the bank the probe's
+    stack lives in (`stack_pointer`; a striped group also contains data, so there
+    they are upper bounds); `xip_*` rows of stage `train.xip_per_sample` are the
+    flash-bus events per training sample (Train(1) minus Train(0))."""
     pass_valid = {}
     merged: dict[tuple[str, int], dict] = {}
     xip_rows = []
@@ -767,18 +920,46 @@ def parse_contention_transcript(text: str, build_config: str, timestamp: str, gi
     for stage in stages:
         by_bank = {b: merged[(stage, b)] for (st, b) in merged if st == stage}
         if not all(b in by_bank and by_bank[b]["contested_avg"] != "" for b in range(8)):
-            continue  # e.g. idle_window (SRAM8/9 contested + SRAM0/4 access only): no group arithmetic
+            continue  # e.g. a per-layer stage with only some banks: no group arithmetic
         group = sum(float(by_bank[b]["contested_avg"]) for b in group_banks)
         other = sum(float(by_bank[b]["contested_avg"]) for b in other_banks)
+        have_access = all(by_bank[b]["access_avg"] != "" for b in range(8))
+        g_acc = f"{sum(float(by_bank[b]['access_avg']) for b in group_banks):.1f}" if have_access else ""
+        o_acc = f"{sum(float(by_bank[b]['access_avg']) for b in other_banks):.1f}" if have_access else ""
         valid = "NO" if any(by_bank[b]["valid"] == "NO" for b in range(8)) else by_bank[0]["valid"]
         base = dict(timestamp=timestamp, git_commit=git_commit, build_config=build_config, stage=stage,
                     access_avg="", valid=valid, contested_pct_of_cycles="", log_file=log_file)
+        if stage in TRAIN_STAGES and have_access:
+            pb = 0 if probe_on_core1 else 4  # the poller's bank: bank 0 beside the core-1 probe, bank 4 otherwise
+            rows.append(dict(base, sram_bank="poller_access", contested_avg="", access_avg=by_bank[pb]["access_avg"]))
+            if stack_pointer is not None:
+                where = bank_of_stack(stack_pointer)
+                if where in ("sram8", "sram9"):
+                    sb = by_bank.get(int(where[-1]))
+                    if sb and sb["contested_avg"] != "" and sb["access_avg"] != "":
+                        rows.append(dict(base, sram_bank=f"stack_bank_{where}", contested_avg=sb["contested_avg"],
+                                         access_avg=sb["access_avg"]))
+                elif where in ("group0-3", "group4-7"):
+                    banks = range(0, 4) if where == "group0-3" else range(4, 8)
+                    rows.append(dict(base, sram_bank=f"stack_bank_{where}",
+                                     contested_avg=f"{sum(float(by_bank[b]['contested_avg']) for b in banks):.1f}",
+                                     access_avg=f"{sum(float(by_bank[b]['access_avg']) for b in banks):.1f}"))
         pct = ""
         cycles = (cycles_by_stage or {}).get(stage)
         if stage in TRAIN_STAGES and cycles:
             pct = f"{100.0 * group / cycles:.4f}"
-        rows.append(dict(base, sram_bank="group", contested_avg=f"{group:.1f}", contested_pct_of_cycles=pct))
-        rows.append(dict(base, sram_bank="other_group_total", contested_avg=f"{other:.1f}"))
+        rows.append(dict(base, sram_bank="group", contested_avg=f"{group:.1f}", access_avg=g_acc,
+                         contested_pct_of_cycles=pct))
+        rows.append(dict(base, sram_bank="other_group_total", contested_avg=f"{other:.1f}", access_avg=o_acc))
+    # Flash-bus events per training sample = (Train(1) - Train(0)) / dataset size.
+    xip = {(r["stage"], r["sram_bank"]): float(r["contested_avg"]) for r in xip_rows}
+    for ev in ("access", "access_contested", "stall_upstream", "stall_downstream"):
+        e1, e0 = xip.get(("train.epoch", f"xip_{ev}")), xip.get(("train.eval_pass", f"xip_{ev}"))
+        if e1 is not None and e0 is not None:
+            xip_rows.append(dict(timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+                                 stage="train.xip_per_sample", sram_bank=f"xip_{ev}",
+                                 contested_avg=f"{(e1 - e0) / NUM_EXAMPLES:.2f}", access_avg="", valid="",
+                                 contested_pct_of_cycles="", log_file=log_file))
     return rows + xip_rows
 
 
@@ -847,10 +1028,25 @@ def check_unexplained(profile_rows: list, build: str) -> bool:
     return ok
 
 
+def check_unexplained_across_builds(gaps: dict) -> bool:
+    """Step 0.5a acceptance: after the harness runs on production's own buffers,
+    train.unexplained_per_sample must also agree between the builds (+-100 cycles)."""
+    if len(gaps) < 2:
+        return True
+    spread = max(gaps.values()) - min(gaps.values())
+    ok = spread <= 100.0
+    log("train.unexplained_per_sample across builds: " + ", ".join(f"{b}={g:+.0f}" for b, g in gaps.items())
+        + f" (spread {spread:.0f}) -- {'OK (<=100)' if ok else 'FAIL: builds disagree'}")
+    return ok
+
+
 def contested_pct_rows(contention_rows: list) -> dict:
     """{stage: group contested total} for the train stages of one build."""
     return {r["stage"]: float(r["contested_avg"]) for r in contention_rows
             if r["sram_bank"] == "group" and r["stage"] in TRAIN_STAGES}
+
+
+MIN_CYCLE_DIFF_FOR_RATIO = 1_000_000.0
 
 
 def cycles_per_contested_rows(per_build: dict, timestamp: str, git_commit: str) -> list[dict]:
@@ -868,13 +1064,18 @@ def cycles_per_contested_rows(per_build: dict, timestamp: str, git_commit: str) 
                     dn = per_build[a][1][stage] - per_build[b][1][stage]
                 except KeyError:
                     continue
-                if abs(dn) < 1000:
-                    log(f"cycles_per_contested {stage} {a}-{b}: contested counts differ by only {dn:.0f}; not meaningful")
-                    continue
-                ratio = dc / dn
-                log(f"cycles_per_contested {stage} {a}-{b}: {dc:.0f} cycles / {dn:.0f} contested = {ratio:.3f}")
+                # E5: a ratio of two small differences is noise that looks like a finding.
+                if abs(dc) < MIN_CYCLE_DIFF_FOR_RATIO:
+                    log(f"cycles_per_contested {stage} {a}-{b}: cycle difference {dc:.0f} < "
+                        f"{MIN_CYCLE_DIFF_FOR_RATIO:.0f}; reported as n/a")
+                    ratio_s = "n/a"
+                elif dn == 0:
+                    ratio_s = "n/a"
+                else:
+                    ratio_s = f"{dc / dn:.4f}"
+                    log(f"cycles_per_contested {stage} {a}-{b}: {dc:.0f} cycles / {dn:.0f} contested = {ratio_s}")
                 rows.append(dict(timestamp=timestamp, git_commit=git_commit, build_config=f"{a}-{b}", stage=stage,
-                                 sram_bank="cycles_per_contested", contested_avg=f"{ratio:.4f}", access_avg="",
+                                 sram_bank="cycles_per_contested", contested_avg=ratio_s, access_avg="",
                                  valid="", contested_pct_of_cycles="", log_file=""))
     return rows
 
@@ -1032,6 +1233,16 @@ Bus contention, production path (totals over Initialise + Train(1); polled from 
   contention stage=train.epoch bank=SRAM7 contested=8000000.0 access=-
   contention stage=train.epoch bank=SRAM8 contested=10.0 access=-
   contention stage=train.epoch bank=SRAM9 contested=20.0 access=-
+  contention stage=train.epoch bank=SRAM0 contested=- access=1000000.0
+  contention stage=train.epoch bank=SRAM1 contested=- access=2000000.0
+  contention stage=train.epoch bank=SRAM2 contested=- access=3000000.0
+  contention stage=train.epoch bank=SRAM3 contested=- access=4000000.0
+  contention stage=train.epoch bank=SRAM4 contested=- access=50000000.0
+  contention stage=train.epoch bank=SRAM5 contested=- access=60000000.0
+  contention stage=train.epoch bank=SRAM6 contested=- access=70000000.0
+  contention stage=train.epoch bank=SRAM7 contested=- access=80000000.0
+  contention stage=train.epoch bank=SRAM8 contested=- access=900.0
+  contention stage=train.epoch bank=SRAM9 contested=- access=77000000.0
 Bus contention, evaluation pass only (Initialise + Train(0); polled from the other core):
   contention stage=train.eval_pass bank=SRAM0 contested=100.0 access=-
   contention stage=train.eval_pass bank=SRAM1 contested=200.0 access=-
@@ -1043,10 +1254,16 @@ Bus contention, evaluation pass only (Initialise + Train(0); polled from the oth
   contention stage=train.eval_pass bank=SRAM7 contested=800000.0 access=-
   contention stage=train.eval_pass bank=SRAM8 contested=1.0 access=-
   contention stage=train.eval_pass bank=SRAM9 contested=2.0 access=-
+XIP (flash) events, production path (whole-run totals; polled from the other core):
+  xip stage=train.epoch event=access per_call=40000000
+  xip stage=train.epoch event=stall_upstream per_call=9000000
+  xip stage=train.eval_pass event=access per_call=8000000
+  xip stage=train.eval_pass event=stall_upstream per_call=1000000
 Placement (net and kernel code addresses; code addresses are added by
 RunAndSaveBenchmarks.py from the ELF symbol table):
-  placement data net                          addr=0x20008a30 mod16=0
-  placement data layer0.m_weights             addr=0x20008a34 mod16=4
+  placement data net                          addr=0x20008a30 mod16=0 off=0
+  placement data layer0.m_weights             addr=0x20008a34 mod16=4 off=4
+  placement data stack_pointer                addr=0x20081f00 mod16=0 off=-
 Profile complete.
 
 """
@@ -1108,6 +1325,25 @@ def run_self_test() -> None:
     assert k0[("train.eval_pass", "group")]["contested_pct_of_cycles"] == f"{100.0 * 1000.0 / 154881639.0:.4f}"
     assert ("layer1.forward", "group") not in k0  # only banks 0,3,4,8 present: no group arithmetic
     assert k0[("compute_loss.flash_labels", "xip_stall_upstream")]["contested_avg"] == "40.50"
+    # Step 0.5: access totals, poller footprint, stack bank, flash events per sample, E5 n/a rule
+    assert k0[("train.epoch", "group")]["access_avg"] == "10000000.0"            # banks 0-3 accesses
+    assert k1[("train.epoch", "group")]["access_avg"] == "260000000.0"           # banks 4-7
+    assert k0[("train.epoch", "poller_access")]["access_avg"] == "50000000.0"    # core0/naive: bank 4
+    assert k1[("train.epoch", "poller_access")]["access_avg"] == "1000000.0"     # core1: bank 0
+    c0s = parse_contention_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core0", "t", "c", "l", stack_pointer=0x20081f00)
+    ks = {(r["stage"], r["sram_bank"]): r for r in c0s}
+    assert ks[("train.epoch", "stack_bank_sram9")]["contested_avg"] == "20.0"
+    assert ks[("train.epoch", "stack_bank_sram9")]["access_avg"] == "77000000.0"
+    c1s = parse_contention_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core1", "t", "c", "l", probe_on_core1=True,
+                                      stack_pointer=0x20041000)
+    assert {(r["stage"], r["sram_bank"]): r for r in c1s}[("train.epoch", "stack_bank_group4-7")]["contested_avg"] == "26000000.0"
+    assert bank_of_stack(0x20081f00) == "sram9" and bank_of_stack(0x20041000) == "group4-7"
+    assert k0[("train.xip_per_sample", "xip_stall_upstream")]["contested_avg"] == f"{(9e6 - 1e6) / NUM_EXAMPLES:.2f}"
+    small = {"a": ({"train.eval_pass": 100.0e6, "train.epoch": 500.0e6}, {"train.eval_pass": 1000.0, "train.epoch": 500.0}),
+             "b": ({"train.eval_pass": 100.5e6, "train.epoch": 500.2e6}, {"train.eval_pass": 400.0, "train.epoch": 100.0})}
+    assert all(r["contested_avg"] == "n/a" for r in cycles_per_contested_rows(small, "t", "c"))
+    assert check_unexplained_across_builds({"core0": 100.0, "core1": 150.0, "naive": 120.0})
+    assert not check_unexplained_across_builds({"core0": 2123.0, "core1": 438.0})
     # the raw per-bank rows still parse as before
     assert k0[("layer1.forward", "3")]["contested_avg"] == "12.5"
     assert k0[("layer1.forward", "3")]["valid"] == "yes"
@@ -1151,10 +1387,44 @@ def run_self_test() -> None:
     placement_rows = parse_placement_transcript(
         SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
     )
-    assert [r["name"] for r in placement_rows] == ["net", "layer0.m_weights"]
+    assert [r["name"] for r in placement_rows] == ["net", "layer0.m_weights", "stack_pointer"]
     assert placement_rows[1]["addr_mod16"] == "4"
     assert placement_rows[1]["address"] == "0x20008a34"
     assert placement_rows[1]["bank"] == "core0-bank"
+    assert placement_rows[1]["instance_offset"] == "4" and placement_rows[2]["instance_offset"] == ""
+    assert placement_rows[0]["binary"] == "profile"
+    assert parse_stream_offsets(SAMPLE_PROFILE_TRANSCRIPT) == {"net": 0, "layer0.m_weights": 4}
+    assert check_profile_addresses(0x20008a30, placement_rows)
+    assert not check_profile_addresses(0x20008a40, placement_rows)
+
+    # Step 0.5b: reproduce the hand analysis of plan section 1.5 from ELF facts alone
+    # (instance symbol, weight offset 0x7548, layer0.forward loop head at forward+0x30).
+    fixture_offsets = {name: 0 for k in range(3) for kn in ("forward", "AccumulateGradients", "ApplyAccumulatedGradients")
+                       for name in kernel_streams(kn, k)}
+    fixture_offsets["layer0.m_weights"] = 0x7548
+    fwd0 = "smlp::StaticLayer<float, 64u, 64u, (ACTIVATION_FUNCTIONS)3, true>::forward(float const*, float*)"
+    expected = {"core0": (0x2000bbc0, 0x20007718, "0"), "core1": (0x20042148, 0x200403e8, "8"),
+                "naive": (0x20025134, 0x20000d48, "12")}
+    for build, (inst, head, phase) in expected.items():
+        nm_text = f"{inst:08x} 00017d90 V test::TestRAMIndependence::mlp_experiment_\n" \
+                  f"{inst + 0x20:08x} 00000004 V guard variable for test::TestRAMIndependence::mlp_experiment_\n"
+        sym = instance_symbol_address(nm_text, "benchmark")
+        assert sym[1] == inst
+        rows = phase_rows("benchmark", build, sym, fixture_offsets, [(fwd0, head, 156)], "t", "c", "l")
+        got = {r["name"].split(" - ")[1]: r["addr_mod16"] for r in rows if r["kind"] == "rel_phase"}
+        assert got["layer0.m_weights"] == phase, (build, got)
+        assert rows[0]["kind"] == "instance" and rows[0]["binary"] == "benchmark"
+    prof_nm = "200440f8 00017d90 b test::profile::(anonymous namespace)::g_prod\n"
+    assert instance_symbol_address(prof_nm, "profile") == ("test::profile::(anonymous namespace)::g_prod", 0x200440f8)
+    try:
+        instance_symbol_address(prof_nm, "benchmark")
+        raise AssertionError("benchmark ELF without mlp_experiment_ must not resolve")
+    except BenchmarkError:
+        pass
+    assert kernel_streams("AccumulateGradients", 0) == ["layer0.m_weights", "layer0.m_grad_accum",
+                                                         "layer0.m_cached_input", "net.m_bp0", "net.m_bp1"]
+    assert kernel_streams("AccumulateGradients", 2)[-1] == "net.m_deriv"
+    assert RE_PHASE_KERNEL.search(fwd0).groups() == ("64", "64", "forward")
 
     log("Self-test OK: parser correctly extracts pinned, naive, profile, placement, contention (incl. per-group totals), golden and loop data.")
 
@@ -1251,6 +1521,8 @@ def main(argv=None) -> int:
     configs_by_name = {c.name: c for c in BUILD_CONFIGS + BASELINE_BUILD_CONFIGS}
     golden_by_build: dict = {}
     per_build_contention: dict = {}
+    unexplained_by_build: dict = {}
+    offsets_this_run: dict = {}
     profile_configs_by_name = {c.name: c for c in PROFILE_BUILD_CONFIGS}
     for name in args.configs:
         if not args.skip_benchmark:
@@ -1321,11 +1593,25 @@ def main(argv=None) -> int:
             placement_rows += elf_code_placement_rows(
                 profile_cfg.elf_path, find_nm(profile_cfg.build_dir), profile_cfg.name,
                 profile_timestamp, git_commit, profile_log_rel, objdump=find_tool(profile_cfg.build_dir, "CMAKE_OBJDUMP", "arm-none-eabi-objdump"))
+            offsets = parse_stream_offsets(profile_transcript)
+            if not offsets:
+                sys.exit(f"{profile_cfg.name}: the profile printed no 'placement data ... off=' lines")
+            if offsets_this_run and offsets != offsets_this_run:
+                sys.exit(f"{profile_cfg.name}: stream offsets differ from an earlier build in this run; "
+                         f"the production type must have one layout in every build")
+            offsets_this_run = offsets
+            inst_name, inst_addr = instance_symbol_address(
+                subprocess.run([find_nm(profile_cfg.build_dir), "-C", "-S", str(profile_cfg.elf_path)],
+                               capture_output=True, text=True, check=True).stdout, "profile")
+            if not check_profile_addresses(inst_addr, [r for r in placement_rows if r["kind"] == "data"]):
+                sys.exit(f"{profile_cfg.name}: ELF instance symbol + offset disagrees with the runtime addresses")
+            sp_rows = [r for r in placement_rows if r["kind"] == "data" and r["name"] == "stack_pointer"]
+            stack_pointer = int(sp_rows[0]["address"], 16) if sp_rows else None
             append_placement_rows_to_csv(placement_rows)
             cycles = profile_cycles(profile_rows)
             contention_rows = parse_contention_transcript(
                 profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel,
-                probe_on_core1=probe_on_core1, cycles_by_stage=cycles)
+                probe_on_core1=probe_on_core1, cycles_by_stage=cycles, stack_pointer=stack_pointer)
             append_contention_rows_to_csv(contention_rows)
             golden_rows = parse_golden_transcript(
                 profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
@@ -1333,6 +1619,7 @@ def main(argv=None) -> int:
             if any(r["repeats_identical"] == "NO" for r in golden_rows):
                 log(f"WARNING: {profile_cfg.name}: repeated Train() runs from one seed were NOT bit-identical")
             check_unexplained(profile_rows, profile_cfg.name)
+            unexplained_by_build[profile_cfg.name] = cycles.get("train.unexplained_per_sample", 0.0)
             invalid = [r for r in contention_rows if r["valid"] == "NO"]
             if invalid:
                 log(f"WARNING: {len(invalid)} per-layer contention row(s) came from a pass whose cycle count drifted "
@@ -1354,6 +1641,33 @@ def main(argv=None) -> int:
             append_contention_rows_to_csv(derived)
     if len(golden_by_build) > 1:
         check_golden_across_builds(golden_by_build)
+    check_unexplained_across_builds(unexplained_by_build)
+
+    # Step 0.5b: static phases of the benchmark and profile ELFs, from the symbol
+    # tables and the offset table (this run's, else the committed one).
+    if offsets_this_run:
+        if read_stream_offsets() != offsets_this_run:
+            log(f"NOTE: the stream offset table changed; rewriting {STREAM_OFFSETS_CSV_PATH.name}")
+        write_stream_offsets(offsets_this_run)
+    offsets = offsets_this_run or read_stream_offsets()
+    if not offsets:
+        log("No stream offset table (run a profile build first); skipping the static phase analysis")
+    else:
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        for name in args.configs:
+            cfg = configs_by_name[name]
+            if cfg.engine != "static":
+                continue
+            for binary, bcfg in (("benchmark", cfg), ("profile", profile_configs_by_name[name])):
+                if not bcfg.elf_path.exists():
+                    log(f"{bcfg.name} {binary}: no ELF at {bcfg.elf_path}; skipping the phase analysis")
+                    continue
+                rows = static_phase_rows(bcfg, binary, offsets, stamp, git_commit, "")
+                append_placement_rows_to_csv(rows)
+                phases = {r["name"]: r["addr_mod16"] for r in rows if r["kind"] == "rel_phase"}
+                key = next((n for n in phases if n.startswith("layer0.forward") and n.endswith("layer0.m_weights")), None)
+                log(f"{bcfg.name} {binary}: {len(rows)} phase rows; layer0.forward vs weights rel_phase = "
+                    f"{phases[key] if key else 'n/a'}")
 
     result_paths = []
     if not args.skip_benchmark:

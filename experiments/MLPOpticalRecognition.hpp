@@ -29,6 +29,10 @@
 #include "mlp/StaticLayer.h"
 #include "dataset/Dataset.hpp"
 
+#if defined(MEML_RUN_PROFILE)
+namespace test { namespace profile { struct Access; } }
+#endif
+
 /**
  * @brief Facade over a fixed-architecture StaticMLP trained on the optical
  * digit-recognition dataset.
@@ -95,6 +99,10 @@ public:
     MEML_MLP_CODE uint32_t Predict(const std::array<dataset::DataType, dataset::kFeatureSize> & input);
 
 private:
+#if defined(MEML_RUN_PROFILE)
+    // Profile-only accessor (tests/ProfileForwardBackward.cpp): no new code.
+    friend struct ::test::profile::Access;
+#endif
     /**
      * @brief All of this experiment's core-local storage: the network plus
      * every scratch buffer Train()/Predict() use.

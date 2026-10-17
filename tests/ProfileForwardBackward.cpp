@@ -81,14 +81,29 @@ struct Stat {
     }
 };
 
+// The production instance (see "Production-path probe object" below); declared
+// first because the placement printer takes offsets relative to it.
+MEML_MLP_DATA MLPOpticalRecognition g_prod{};
+
 /// Prints one stream's address for the placement record. The addr%16 column is
-/// what plan-mlpBetterOptimisation.md section 1.6 needs to correlate cycle
-/// counts with SRAM bank phase; RunAndSaveBenchmarks.py parses these lines
-/// ("placement data <name> addr=0x... mod16=N") into placement_results.csv.
+/// what plan-mlpBetterOptimisation.md section 1.5 needs to correlate cycle
+/// counts with SRAM bank phase; `off` is the offset from the start of the
+/// production instance g_prod (Step 0.5b: the benchmark ELF has the same type at
+/// a different address, so absolute address = its instance symbol + off).
+/// RunAndSaveBenchmarks.py parses these lines
+/// ("placement data <name> addr=0x... mod16=N off=M") into placement_results.csv
+/// and stream_offsets.csv. Streams outside g_prod (the stack) print off=-.
+void PrintPlacement(const char* name, const void* p);
+
 void PrintPlacement(const char* name, const void* p) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    printf("  placement data %-28s addr=0x%08lx mod16=%lu\n",
-           name, static_cast<unsigned long>(a), static_cast<unsigned long>(a & 15u));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(&g_prod);
+    if (a >= base && a < base + sizeof(g_prod))
+        printf("  placement data %-28s addr=0x%08lx mod16=%lu off=%lu\n", name, static_cast<unsigned long>(a),
+               static_cast<unsigned long>(a & 15u), static_cast<unsigned long>(a - base));
+    else
+        printf("  placement data %-28s addr=0x%08lx mod16=%lu off=-\n", name, static_cast<unsigned long>(a),
+               static_cast<unsigned long>(a & 15u));
 }
 
 void PrintStage(const char* name, const Stat & s) {
@@ -118,13 +133,19 @@ void PrintValue(const char* name, uint32_t value, uint32_t max_value) {
 
 struct CounterSel { uint8_t bank; bool access; };
 
-// Three passes cover the ten SRAM banks (4 counters each); pass 3 also reads
-// SRAM0/SRAM4 ACCESS as sanity totals. Pass numbering starts at 1 (0 = no
-// counters, the pure cycle measurement).
-constexpr CounterSel kPassSel[3][4] = {
+// Passes 1-3 cover the contested counts of the ten SRAM banks (4 counters
+// each); pass 3 also reads SRAM0/SRAM4 ACCESS as sanity totals. Passes 4-6
+// (Step 0.5e/0.5g) add the ACCESS counts of all ten banks (4-6 are only used for
+// whole-run totals, never by the per-layer harness). Pass numbering starts at 1
+// (0 = no counters, the pure cycle measurement).
+constexpr int kNumPasses = 6;
+constexpr CounterSel kPassSel[kNumPasses][4] = {
     {{0, false}, {1, false}, {2, false}, {3, false}},
     {{4, false}, {5, false}, {6, false}, {7, false}},
     {{8, false}, {9, false}, {0, true},  {4, true}},
+    {{0, true},  {1, true},  {2, true},  {3, true}},
+    {{4, true},  {5, true},  {6, true},  {7, true}},
+    {{8, true},  {9, true},  {0, true},  {4, true}},
 };
 
 uint8_t EventFor(const CounterSel & s) {
@@ -222,9 +243,27 @@ PROFILE_SERVICE_ATTR void ServiceLoop() {
     }
 }
 
-// Probe-core side of the protocol.
+constexpr uint8_t kXipSel[4] = {
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS_CONTESTED,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_UPSTREAM,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_DOWNSTREAM,
+};
+constexpr const char* kXipNames[4] = {"access", "access_contested", "stall_upstream", "stall_downstream"};
+
+void ProgramXipCounters() {
+    busctrl_hw->perfctr_en = 0;
+    for (int k = 0; k < 4; ++k) {
+        busctrl_hw->counter[k].sel = kXipSel[k];
+        busctrl_hw->counter[k].value = 0;
+    }
+    busctrl_hw->perfctr_en = 1;
+}
+
+// Probe-core side of the protocol. pass == 0 programs the four XIP (flash)
+// events instead of SRAM bank events.
 void PollStart(int pass) {
-    ProgramCounters(pass);
+    if (pass == 0) ProgramXipCounters(); else ProgramCounters(pass);
     g_poll.stop.store(0, std::memory_order_relaxed);
     g_poll.ready.store(0, std::memory_order_relaxed);
     multicore_fifo_push_blocking(kCmdPoll);
@@ -258,37 +297,84 @@ struct LayerPass {
 
 using Net = MLPOpticalRecognition::Net;
 
-// Same placement class as the production instance's network (MEML_MLP_DATA:
-// the pinned core's bank), not core 0's default bank.
-MEML_MLP_DATA Net g_net{};
+}  // namespace
 
-/// One pass of kIterations forward+loss+backward over real samples. pass == 0
-/// takes no counter snapshots (the reference cycle measurement); pass 1..3
-/// brackets every stage with counter reads taken OUTSIDE the timed region
-/// (read, then t0 ... t1, then read), so the APB loads do not add contention
-/// inside the bracket. Tagged like the production hot path so the inlined
-/// kernels execute from the pinned core's bank, as in Train().
+// Production's own network and scratch buffers. The per-layer harness runs on
+// THESE (Step 0.5a), not on a twin network with stack scratch, so the kernels see
+// the same addresses, the same bank phases and the same back-propagation
+// buffers as MLPOpticalRecognition::Train(). Befriended by StaticMLP and
+// MLPOpticalRecognition under MEML_RUN_PROFILE; adds no code to the hot path.
+struct Access {
+    using T = dataset::DataType;
+    static Net & net(MLPOpticalRecognition & m) { return m.state_.net; }
+    static T* buf_a(Net & n) { return n.m_buf_a.data(); }
+    static T* buf_b(Net & n) { return n.m_buf_b.data(); }
+    static T* pred(Net & n) { return n.m_pred.data(); }
+    static T* deriv(Net & n) { return n.m_deriv.data(); }
+    static T* bp0(Net & n) { return n.m_bp0.data(); }
+    static T* bp1(Net & n) { return n.m_bp1.data(); }
+    static std::size_t* shuffle(MLPOpticalRecognition & m) { return m.state_.shuffle_indices.data(); }
+    static T* input_scratch(MLPOpticalRecognition & m) { return m.state_.input_scratch.data(); }
+    static T* output_scratch(MLPOpticalRecognition & m) { return m.state_.output_scratch.data(); }
+};
+
+namespace {
+
+// ════════════════════════════════════════════════════════════════════════
+//  Production-path probe object
+// ════════════════════════════════════════════════════════════════════════
+// The REAL facade, placed exactly as in the benchmark (MEML_MLP_DATA in the
+// pinned bank): Train()'s inlined backward/RMSProp code, at its own addresses.
+// (g_prod itself is declared at the top of this file's anonymous namespace.)
+
+constexpr uint32_t kProbeSeed = 0xC0DEu;
+
+/// Fisher-Yates over the production shuffle buffer with a local xorshift, so the
+/// harness reads its samples through the same `features + s * stride` path, in a
+/// scattered order like Train(), straight from flash.
+void ShuffleProbeIndices() {
+    std::size_t* idx = Access::shuffle(g_prod);
+    const std::size_t n = dataset::kNumExamples;
+    for (std::size_t i = 0; i < n; ++i) idx[i] = i;
+    uint32_t x = kProbeSeed | 1u;
+    for (std::size_t i = n; i > 1; --i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        const std::size_t j = x % i;
+        const std::size_t t = idx[i - 1]; idx[i - 1] = idx[j]; idx[j] = t;
+    }
+}
+
+/// One pass of kIterations forward+loss+backward over real samples, on
+/// g_prod's own network and buffers, each stage in exactly the role
+/// StaticMLP::TrainBatch / backprop_accumulate gives it: forward ping-pongs
+/// m_buf_a/m_buf_b (layer I writes `(I & 1) ? m_buf_b : m_buf_a`) and the last
+/// output is copied into m_pred; the loss writes m_deriv; backward uses
+/// `(I & 1) ? m_bp1 : m_bp0` as delta_out and the previous layer's delta (or
+/// m_deriv) as the error. No stack arrays reach a kernel. pass == 0 takes no
+/// counter snapshots (the reference cycle measurement); pass 1..3 brackets
+/// every stage with counter reads taken OUTSIDE the timed region (read, then
+/// t0 ... t1, then read), so the APB loads do not add contention inside the
+/// bracket. Tagged like the production hot path so the inlined kernels execute
+/// from the pinned core's bank, as in Train().
 MEML_MLP_CODE void RunLayerPass(int pass, LayerPass & out) {
-    auto & layer0 = g_net.layer<0>();
-    auto & layer1 = g_net.layer<1>();
-    auto & layer2 = g_net.layer<2>();
-
-    // Scratch buffers sized to the widest layer (64) so one set covers every
-    // inter-layer handoff; only the first kIn/kOut elements of each are ever
-    // read/written for a given layer.
-    std::array<dataset::DataType, Net::kMaxWidth> buf_a{}, buf_b{};
-    std::array<dataset::DataType, dataset::kLabelSize> pred{}, deriv{};
-    std::array<dataset::DataType, Net::kMaxWidth> delta_a{}, delta_b{};
-    // layer0.AccumulateGradients() always writes NIn (64) delta values even
-    // though there is no earlier layer left to consume them.
-    std::array<dataset::DataType, Net::kMaxWidth> delta_layer0{};
+    Net & net = Access::net(g_prod);
+    auto & layer0 = net.layer<0>();
+    auto & layer1 = net.layer<1>();
+    auto & layer2 = net.layer<2>();
+    dataset::DataType* const buf_a = Access::buf_a(net);
+    dataset::DataType* const buf_b = Access::buf_b(net);
+    dataset::DataType* const pred = Access::pred(net);
+    dataset::DataType* const deriv = Access::deriv(net);
+    dataset::DataType* const bp0 = Access::bp0(net);
+    dataset::DataType* const bp1 = Access::bp1(net);
+    const std::size_t* const shuffle = Access::shuffle(g_prod);
 
     if (pass > 0) ProgramCounters(pass);
 
     for (int it = 0; it < kIterations; ++it) {
-        const std::size_t s = static_cast<std::size_t>(it) % dataset::kNumExamples;
-        const dataset::DataType* feat = dataset::features[s].data();
-        const dataset::DataType* label = dataset::labels[s].data();
+        const std::size_t s = shuffle[it];
+        const dataset::DataType* feat = dataset::features[0].data() + s * dataset::kFeatureSize;
+        const dataset::DataType* label = dataset::labels[0].data() + s * dataset::kLabelSize;
 
         uint32_t t[kStages];
         uint32_t c_before[kStages][4];
@@ -311,14 +397,16 @@ MEML_MLP_CODE void RunLayerPass(int pass, LayerPass & out) {
             if (pass > 0) ReadCounters(c_after[idx]);                     \
         } while (0)
 
-        PROFILE_STAGE(0, layer0.forward(feat, buf_a.data()));
-        PROFILE_STAGE(1, layer1.forward(buf_a.data(), buf_b.data()));
-        PROFILE_STAGE(2, layer2.forward(buf_b.data(), pred.data()));
+        PROFILE_STAGE(0, layer0.forward(feat, buf_a));
+        PROFILE_STAGE(1, layer1.forward(buf_a, buf_b));
+        // Layer 2 writes m_buf_a (parity), then Train() copies it to m_pred.
+        PROFILE_STAGE(2, layer2.forward(buf_b, buf_a);
+                         for (std::size_t o = 0; o < dataset::kLabelSize; ++o) pred[o] = buf_a[o]);
         PROFILE_STAGE(3, smlp::compute_loss<loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>(
-            label, pred.data(), deriv.data(), dataset::kLabelSize, dataset::DataType(1)));
-        PROFILE_STAGE(4, layer2.AccumulateGradients(layer2.m_cached_input.data(), deriv.data(), delta_b.data()));
-        PROFILE_STAGE(5, layer1.AccumulateGradients(layer1.m_cached_input.data(), delta_b.data(), delta_a.data()));
-        PROFILE_STAGE(6, layer0.AccumulateGradients(layer0.m_cached_input.data(), delta_a.data(), delta_layer0.data()));
+            label, pred, deriv, dataset::kLabelSize, dataset::DataType(1)));
+        PROFILE_STAGE(4, layer2.AccumulateGradients(layer2.m_cached_input.data(), deriv, bp0));
+        PROFILE_STAGE(5, layer1.AccumulateGradients(layer1.m_cached_input.data(), bp0, bp1));
+        PROFILE_STAGE(6, layer0.AccumulateGradients(layer0.m_cached_input.data(), bp1, bp0));
 #undef PROFILE_STAGE
 
         restore_interrupts(ints);
@@ -350,17 +438,22 @@ constexpr int kBatchIterations = 20;
 /// (ScaleAccumulatedGradients) is not measured: it runs only when the norm
 /// exceeds 5.0.
 MEML_MLP_CODE void RunBatchStages(BatchStages & b) {
-    auto & layer0 = g_net.layer<0>();
-    auto & layer1 = g_net.layer<1>();
-    auto & layer2 = g_net.layer<2>();
-    std::array<dataset::DataType, Net::kMaxWidth> buf_a{}, buf_b{};
-    std::array<dataset::DataType, dataset::kLabelSize> pred{}, deriv{};
-    std::array<dataset::DataType, Net::kMaxWidth> delta_a{}, delta_b{}, delta_layer0{};
+    Net & net = Access::net(g_prod);
+    auto & layer0 = net.layer<0>();
+    auto & layer1 = net.layer<1>();
+    auto & layer2 = net.layer<2>();
+    dataset::DataType* const buf_a = Access::buf_a(net);
+    dataset::DataType* const buf_b = Access::buf_b(net);
+    dataset::DataType* const pred = Access::pred(net);
+    dataset::DataType* const deriv = Access::deriv(net);
+    dataset::DataType* const bp0 = Access::bp0(net);
+    dataset::DataType* const bp1 = Access::bp1(net);
+    const std::size_t* const shuffle = Access::shuffle(g_prod);
     constexpr float kLearningRate = 0.01f; // matches TestRAMIndependence
     const dataset::DataType batch_inv = dataset::DataType(1) / static_cast<dataset::DataType>(kBatchSize);
 
     for (int it = 0; it < kBatchIterations; ++it) {
-        const std::size_t s = static_cast<std::size_t>(it) % dataset::kNumExamples;
+        const std::size_t s = shuffle[it];
 
         uint32_t ints = save_and_disable_interrupts();
         uint32_t t0 = Cycles();
@@ -371,14 +464,15 @@ MEML_MLP_CODE void RunBatchStages(BatchStages & b) {
         restore_interrupts(ints);
 
         // Untimed: populate the accumulators with a real sample's gradients.
-        layer0.forward(dataset::features[s].data(), buf_a.data());
-        layer1.forward(buf_a.data(), buf_b.data());
-        layer2.forward(buf_b.data(), pred.data());
+        layer0.forward(dataset::features[0].data() + s * dataset::kFeatureSize, buf_a);
+        layer1.forward(buf_a, buf_b);
+        layer2.forward(buf_b, buf_a);
+        for (std::size_t o = 0; o < dataset::kLabelSize; ++o) pred[o] = buf_a[o];
         smlp::compute_loss<loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>(
-            dataset::labels[s].data(), pred.data(), deriv.data(), dataset::kLabelSize, dataset::DataType(1));
-        layer2.AccumulateGradients(layer2.m_cached_input.data(), deriv.data(), delta_b.data());
-        layer1.AccumulateGradients(layer1.m_cached_input.data(), delta_b.data(), delta_a.data());
-        layer0.AccumulateGradients(layer0.m_cached_input.data(), delta_a.data(), delta_layer0.data());
+            dataset::labels[0].data() + s * dataset::kLabelSize, pred, deriv, dataset::kLabelSize, dataset::DataType(1));
+        layer2.AccumulateGradients(layer2.m_cached_input.data(), deriv, bp0);
+        layer1.AccumulateGradients(layer1.m_cached_input.data(), bp0, bp1);
+        layer0.AccumulateGradients(layer0.m_cached_input.data(), bp1, bp0);
 
         ints = save_and_disable_interrupts();
         t0 = Cycles();
@@ -415,11 +509,6 @@ MEML_MLP_CODE void RunBatchStages(BatchStages & b) {
 // ════════════════════════════════════════════════════════════════════════
 //  Production-path probe
 // ════════════════════════════════════════════════════════════════════════
-// The REAL facade, placed exactly as in the benchmark (MEML_MLP_DATA in the
-// pinned bank): Train()'s inlined backward/RMSProp code, at its own addresses.
-MEML_MLP_DATA MLPOpticalRecognition g_prod{};
-
-constexpr uint32_t kProbeSeed = 0xC0DEu;
 constexpr float kProbeLR = 0.01f;
 constexpr int kProbeRepeats = 3;
 
@@ -481,19 +570,18 @@ struct LossVariants {
     uint64_t xip[4] = {};   // access, access_contested, stall_upstream, stall_downstream
 };
 
-constexpr uint8_t kXipSel[4] = {
-    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS,
-    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS_CONTESTED,
-    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_UPSTREAM,
-    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_DOWNSTREAM,
-};
-
 MEML_MLP_CODE void RunLossVariants(LossVariants & out) {
-    auto & layer0 = g_net.layer<0>();
-    auto & layer1 = g_net.layer<1>();
-    auto & layer2 = g_net.layer<2>();
-    std::array<dataset::DataType, Net::kMaxWidth> buf_a{}, buf_b{};
-    std::array<dataset::DataType, dataset::kLabelSize> pred{}, deriv{}, label_ram{};
+    Net & net = Access::net(g_prod);
+    auto & layer0 = net.layer<0>();
+    auto & layer1 = net.layer<1>();
+    auto & layer2 = net.layer<2>();
+    dataset::DataType* const buf_a = Access::buf_a(net);
+    dataset::DataType* const buf_b = Access::buf_b(net);
+    dataset::DataType* const pred = Access::pred(net);
+    dataset::DataType* const deriv = Access::deriv(net);
+    // The RAM copy of the label lives in production's own output scratch.
+    dataset::DataType* const label_ram = Access::output_scratch(g_prod);
+    const std::size_t* const shuffle = Access::shuffle(g_prod);
 
     for (int variant = 0; variant < 3; ++variant) {
         if (variant == 2) {
@@ -505,21 +593,22 @@ MEML_MLP_CODE void RunLossVariants(LossVariants & out) {
             busctrl_hw->perfctr_en = 1;
         }
         for (int it = 0; it < kIterations; ++it) {
-            const std::size_t s = static_cast<std::size_t>(it) % dataset::kNumExamples;
-            layer0.forward(dataset::features[s].data(), buf_a.data());
-            layer1.forward(buf_a.data(), buf_b.data());
-            layer2.forward(buf_b.data(), pred.data());
-            const dataset::DataType* label = dataset::labels[s].data();
+            const std::size_t s = shuffle[it];
+            layer0.forward(dataset::features[0].data() + s * dataset::kFeatureSize, buf_a);
+            layer1.forward(buf_a, buf_b);
+            layer2.forward(buf_b, buf_a);
+            for (std::size_t o = 0; o < dataset::kLabelSize; ++o) pred[o] = buf_a[o];
+            const dataset::DataType* label = dataset::labels[0].data() + s * dataset::kLabelSize;
             if (variant == 1) {
                 for (std::size_t i = 0; i < dataset::kLabelSize; ++i) label_ram[i] = label[i];
-                label = label_ram.data();
+                label = label_ram;
             }
             uint32_t before[4] = {};
             if (variant == 2) ReadCounters(before);
             const uint32_t ints = save_and_disable_interrupts();
             const uint32_t t0 = Cycles();
             smlp::compute_loss<loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>(
-                label, pred.data(), deriv.data(), dataset::kLabelSize, dataset::DataType(1));
+                label, pred, deriv, dataset::kLabelSize, dataset::DataType(1));
             const uint32_t dt = Cycles() - t0;
             restore_interrupts(ints);
             if (variant == 2) {
@@ -531,6 +620,23 @@ MEML_MLP_CODE void RunLossVariants(LossVariants & out) {
             else if (variant == 0) out.flash.add(dt);
         }
     }
+}
+
+/// Sleeps this core in WFE until TIMER0 alarm 1 fires (same SEVONPEND scheme as
+/// the poller: no NVIC enable, no handler), so that nothing but the poller moves
+/// on the bus while the footprint is measured. busy_wait_ms() would instead
+/// measure the probe's own spinning (E4).
+MEML_MLP_CODE void SleepWfeUs(uint32_t us) {
+    constexpr uint32_t kBit = 1u << 1;
+    SCB->SCR |= SCB_SCR_SEVONPEND_Msk;
+    timer_hw->intr = kBit;
+    NVIC->ICPR[0] = 1u << TIMER0_IRQ_1;
+    timer_hw->inte |= kBit;
+    timer_hw->alarm[1] = timer_hw->timerawl + us;
+    while (!(timer_hw->ints & kBit)) __wfe();
+    timer_hw->inte &= ~kBit;
+    timer_hw->intr = kBit;
+    NVIC->ICPR[0] = 1u << TIMER0_IRQ_1;
 }
 
 /// Everything the probe core does. Runs on core 1 for the core-1-pinned build,
@@ -546,12 +652,13 @@ MEML_MLP_CODE void ProbeBody() {
     uintptr_t sp;
     asm volatile("mov %0, sp" : "=r"(sp));
 
-    g_net.SetSeed(0xC0DEu);
-    g_net.InitXavier();
+    g_prod.Initialise(kProbeSeed);
+    ShuffleProbeIndices();
 
-    auto & layer0 = g_net.layer<0>();
-    auto & layer1 = g_net.layer<1>();
-    auto & layer2 = g_net.layer<2>();
+    Net & net = Access::net(g_prod);
+    auto & layer0 = net.layer<0>();
+    auto & layer1 = net.layer<1>();
+    auto & layer2 = net.layer<2>();
 
     // ── Pass 0: pure cycles; passes 1..3: same loop with counter snapshots ──
     static LayerPass passes[4]; // static: the probe core's stack is only 4 KB
@@ -584,7 +691,6 @@ MEML_MLP_CODE void ProbeBody() {
     PrintStage("compute_loss.flash_labels", loss_var.flash);
     PrintStage("compute_loss.ram_labels", loss_var.ram);
     {
-        static const char* const kXipNames[4] = {"access", "access_contested", "stall_upstream", "stall_downstream"};
         for (int k = 0; k < 4; ++k)
             printf("  xip stage=compute_loss.flash_labels event=%s per_call=%.2f\n", kXipNames[k],
                    static_cast<double>(loss_var.xip[k]) / static_cast<double>(kIterations));
@@ -659,7 +765,7 @@ MEML_MLP_CODE void ProbeBody() {
 
     // ── Production-path contention: whole Train(1) per pass, drained by the service core ──
     printf("Bus contention, production path (totals over Initialise + Train(1); polled from the other core):\n");
-    for (int pass = 1; pass <= 3; ++pass) {
+    for (int pass = 1; pass <= kNumPasses; ++pass) {
         double totals[4];
         PollStart(pass);
         RunTrainOnce();
@@ -669,7 +775,7 @@ MEML_MLP_CODE void ProbeBody() {
 
     // ── Evaluation-only contention (Step 0d): Train(0), localises a gap to the forward path ──
     printf("Bus contention, evaluation pass only (Initialise + Train(0); polled from the other core):\n");
-    for (int pass = 1; pass <= 3; ++pass) {
+    for (int pass = 1; pass <= kNumPasses; ++pass) {
         double totals[4];
         PollStart(pass);
         RunEvalOnce();
@@ -677,44 +783,67 @@ MEML_MLP_CODE void ProbeBody() {
         PrintContention("train.eval_pass", pass, totals);
     }
 
-    // ── Poller footprint: counters while the probe core idles and the service core polls ──
-    printf("Poller footprint (probe core idle for ~50 ms, service core polling):\n");
-    {
+    // ── Flash (XIP) traffic of the production path (Step 0.5d). The dataset lives
+    // in flash behind a cache both cores share; these are whole-run totals, so the
+    // script derives stall cycles per training sample from Train(1) minus Train(0).
+    printf("XIP (flash) events, production path (whole-run totals; polled from the other core):\n");
+    for (int run = 0; run < 2; ++run) {
         double totals[4];
-        PollStart(3); // SRAM8/9 contested + SRAM0/4 access
-        busy_wait_ms(50);
+        PollStart(0);
+        if (run == 0) RunTrainOnce(); else RunEvalOnce();
         PollStop(totals);
-        PrintContention("idle_window", 3, totals);
+        for (int k = 0; k < 4; ++k)
+            printf("  xip stage=%s event=%s per_call=%.0f\n",
+                   run == 0 ? "train.epoch" : "train.eval_pass", kXipNames[k], totals[k]);
+    }
+
+    // ── Poller footprint (Step 0.5e): the probe core sleeps in WFE on a 50 ms
+    // alarm, so the only SRAM traffic in the window is the poller's own (plus the
+    // other core's USB/SDK background). Contested AND access counts on all ten
+    // banks, six 50 ms windows (one per counter pass). ──
+    printf("Poller footprint (probe core asleep in WFE for 50 ms per pass, service core polling):\n");
+    for (int pass = 1; pass <= kNumPasses; ++pass) {
+        double totals[4];
+        PollStart(pass);
+        SleepWfeUs(50000);
+        PollStop(totals);
+        PrintContention("poller_footprint", pass, totals);
     }
 
     // ── Placement of everything the kernels touch ──
     printf("Placement (net and kernel code addresses; code addresses are added by\n");
     printf("RunAndSaveBenchmarks.py from the ELF symbol table):\n");
     PrintPlacement("stack_pointer", reinterpret_cast<const void*>(sp));
-    PrintPlacement("net", &g_net);
+#if PROFILE_PROBE_ON_CORE1
+    PrintPlacement("stack_bottom", __core1_stack_bottom__);
+    PrintPlacement("stack_top", __core1_stack_top__);
+#endif
+    PrintPlacement("net", &net);
     PrintPlacement("prod_instance", &g_prod);
     printf("  prod_instance size=%lu bytes\n", static_cast<unsigned long>(sizeof(g_prod)));
-    PrintPlacement("layer0.m_weights", layer0.m_weights.data());
-    PrintPlacement("layer0.m_grad_accum", layer0.m_grad_accum.data());
-    PrintPlacement("layer0.m_cached_input", layer0.m_cached_input.data());
-    PrintPlacement("layer0.m_inner_products", layer0.m_inner_products.data());
-    PrintPlacement("layer0.m_act_output", layer0.m_act_output.data());
-    PrintPlacement("layer0.m_biases", layer0.m_biases.data());
-    PrintPlacement("layer0.m_bias_grad_accum", layer0.m_bias_grad_accum.data());
-    PrintPlacement("layer1.m_weights", layer1.m_weights.data());
-    PrintPlacement("layer1.m_grad_accum", layer1.m_grad_accum.data());
-    PrintPlacement("layer1.m_cached_input", layer1.m_cached_input.data());
-    PrintPlacement("layer1.m_inner_products", layer1.m_inner_products.data());
-    PrintPlacement("layer1.m_act_output", layer1.m_act_output.data());
-    PrintPlacement("layer1.m_biases", layer1.m_biases.data());
-    PrintPlacement("layer1.m_bias_grad_accum", layer1.m_bias_grad_accum.data());
-    PrintPlacement("layer2.m_weights", layer2.m_weights.data());
-    PrintPlacement("layer2.m_grad_accum", layer2.m_grad_accum.data());
-    PrintPlacement("layer2.m_cached_input", layer2.m_cached_input.data());
-    PrintPlacement("layer2.m_inner_products", layer2.m_inner_products.data());
-    PrintPlacement("layer2.m_act_output", layer2.m_act_output.data());
-    PrintPlacement("layer2.m_biases", layer2.m_biases.data());
-    PrintPlacement("layer2.m_bias_grad_accum", layer2.m_bias_grad_accum.data());
+    // Streams the hot loops touch that belong to the network, not to a layer.
+    PrintPlacement("net.m_buf_a", Access::buf_a(net));
+    PrintPlacement("net.m_buf_b", Access::buf_b(net));
+    PrintPlacement("net.m_pred", Access::pred(net));
+    PrintPlacement("net.m_deriv", Access::deriv(net));
+    PrintPlacement("net.m_bp0", Access::bp0(net));
+    PrintPlacement("net.m_bp1", Access::bp1(net));
+    PrintPlacement("state.shuffle_indices", Access::shuffle(g_prod));
+    PrintPlacement("state.input_scratch", Access::input_scratch(g_prod));
+    PrintPlacement("state.output_scratch", Access::output_scratch(g_prod));
+#define PRINT_LAYER_STREAMS(L, layer)                                                         \
+    PrintPlacement("layer" #L ".m_weights", (layer).m_weights.data());                        \
+    PrintPlacement("layer" #L ".m_grad_accum", (layer).m_grad_accum.data());                  \
+    PrintPlacement("layer" #L ".m_sq_grad_avg", (layer).m_sq_grad_avg.data());                \
+    PrintPlacement("layer" #L ".m_cached_input", (layer).m_cached_input.data());              \
+    PrintPlacement("layer" #L ".m_inner_products", (layer).m_inner_products.data());          \
+    PrintPlacement("layer" #L ".m_act_output", (layer).m_act_output.data());                  \
+    PrintPlacement("layer" #L ".m_biases", (layer).m_biases.data());                          \
+    PrintPlacement("layer" #L ".m_bias_grad_accum", (layer).m_bias_grad_accum.data())
+    PRINT_LAYER_STREAMS(0, layer0);
+    PRINT_LAYER_STREAMS(1, layer1);
+    PRINT_LAYER_STREAMS(2, layer2);
+#undef PRINT_LAYER_STREAMS
     printf("Profile complete.\n");
     printf("\n");
 }
