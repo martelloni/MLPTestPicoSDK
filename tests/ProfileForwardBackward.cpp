@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -95,6 +96,12 @@ void PrintStage(const char* name, const Stat & s) {
            name, static_cast<double>(s.avg()), static_cast<unsigned long>(s.max_val));
 }
 
+/// Same line format with a signed value (a difference that may be negative).
+void PrintSigned(const char* name, int32_t value) {
+    printf("  %-28s avg=%9.1f cycles   max=%8ld cycles\n",
+           name, static_cast<double>(value), static_cast<long>(value < 0 ? -value : value));
+}
+
 /// A stage line carrying an explicit value (e.g. a min-of-repeats) in the avg slot.
 void PrintValue(const char* name, uint32_t value, uint32_t max_value) {
     printf("  %-28s avg=%9.1f cycles   max=%8lu cycles\n",
@@ -155,11 +162,21 @@ void PrintContention(const char* stage, int pass, const double (&per_counter)[4]
 }
 
 // ── Poller: runs on the OTHER core while the probe core runs a long workload.
-// The counters are 24-bit and saturate at ~16.7M, which one training epoch
-// (~600M cycles) overruns, so the service core drains them every ~0.5 ms
-// (read, then clear) into 64-bit totals. A handful of events can fall between a
-// read and its clear; at <0.01% of a ~75k-event window that is below the noise.
+// The counters are 24-bit and saturate at ~16.7M events, which one training
+// epoch (~600M cycles) overruns, so the service core drains them (read, then
+// clear) into 64-bit totals. Step 0b: it does so EVENT-DRIVEN, not by spinning.
+// A TIMER0 alarm fires every kPollPeriodUs; the service core sleeps in WFE in
+// between and is woken by the alarm becoming pending (SCR.SEVONPEND, so the
+// interrupt needs no NVIC enable, no handler and no vector fetch) or by the
+// probe core's SEV on stop. The poller's own SRAM traffic is therefore a few
+// accesses per wake-up instead of a continuous stream, which would otherwise
+// pollute the very bank-contention counts it is collecting (and violate the
+// "other core dormant" condition). A handful of events can fall between a read
+// and its clear; that is far below the noise at these totals.
 enum : uint32_t { kCmdPoll = 1, kCmdQuit = 2, kReplyDone = 0xD0DE };
+
+constexpr uint32_t kPollAlarm = 2;            // TIMER0 alarm 2 (the SDK's default pool uses 3)
+constexpr uint32_t kPollPeriodUs = 10000;     // 10 ms: counters saturate after >100 ms at 150 MHz
 
 struct PollShared {
     std::atomic<uint32_t> ready{0};
@@ -172,21 +189,30 @@ PollShared g_poll;
 /// is used inside the polling loop (no calls), so with PROFILE_SERVICE_ATTR its
 /// whole fetch stream stays in the service core's own bank.
 PROFILE_SERVICE_ATTR void ServiceLoop() {
+    constexpr uint32_t kAlarmBit = 1u << kPollAlarm;
     for (;;) {
         const uint32_t cmd = multicore_fifo_pop_blocking_inline();
         if (cmd == kCmdQuit) return;
         if (cmd != kCmdPoll) continue;
 
         uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+        SCB->SCR |= SCB_SCR_SEVONPEND_Msk;
+        timer_hw->inte |= kAlarmBit; // IRQ line asserts; left disabled in this core's NVIC
         g_poll.ready.store(1, std::memory_order_release);
         while (!g_poll.stop.load(std::memory_order_acquire)) {
             t0 += busctrl_hw->counter[0].value; busctrl_hw->counter[0].value = 0;
             t1 += busctrl_hw->counter[1].value; busctrl_hw->counter[1].value = 0;
             t2 += busctrl_hw->counter[2].value; busctrl_hw->counter[2].value = 0;
             t3 += busctrl_hw->counter[3].value; busctrl_hw->counter[3].value = 0;
-            const uint32_t until = timer_hw->timerawl + 500u; // ~0.5 ms (1 MHz timer)
-            while (static_cast<int32_t>(timer_hw->timerawl - until) < 0) {}
+            timer_hw->intr = kAlarmBit;                    // clear the source, then the latched pending bit
+            NVIC->ICPR[0] = 1u << TIMER0_IRQ_2;
+            timer_hw->alarm[kPollAlarm] = timer_hw->timerawl + kPollPeriodUs;
+            while (!g_poll.stop.load(std::memory_order_acquire) && !(timer_hw->ints & kAlarmBit))
+                __wfe();
         }
+        timer_hw->inte &= ~kAlarmBit;
+        timer_hw->intr = kAlarmBit;
+        NVIC->ICPR[0] = 1u << TIMER0_IRQ_2;
         t0 += busctrl_hw->counter[0].value;
         t1 += busctrl_hw->counter[1].value;
         t2 += busctrl_hw->counter[2].value;
@@ -207,6 +233,7 @@ void PollStart(int pass) {
 
 void PollStop(double (&totals)[4]) {
     g_poll.stop.store(1, std::memory_order_release);
+    __sev(); // wake the service core out of its WFE
     (void)multicore_fifo_pop_blocking(); // kReplyDone
     for (int k = 0; k < 4; ++k) totals[k] = static_cast<double>(g_poll.total[k]);
 }
@@ -402,21 +429,32 @@ struct Reps {
     uint32_t max() const { uint32_t m = v[0]; for (int i = 1; i < kProbeRepeats; ++i) if (v[i] > m) m = v[i]; return m; }
 };
 
+/// Final loss/accuracy of every Train() run from kProbeSeed, kept to prove the
+/// runs are bit-identical (golden G0, Step 0f).
+struct Golden {
+    MLPOpticalRecognition::Result eval[kProbeRepeats] = {};
+    MLPOpticalRecognition::Result epoch[kProbeRepeats] = {};
+};
+
+bool SameBits(const MLPOpticalRecognition::Result & a, const MLPOpticalRecognition::Result & b) {
+    return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
+
 /// Train(0): forward + loss over all samples, no weight update (the evaluation
 /// pass). Train(1): one training epoch plus that same evaluation pass. Not
 /// interrupt-masked (an epoch is seconds long; masking would starve USB); the
 /// printed figure is the min of kProbeRepeats.
-MEML_MLP_CODE void MeasureTrain(Reps & eval, Reps & epoch) {
+MEML_MLP_CODE void MeasureTrain(Reps & eval, Reps & epoch, Golden & golden) {
     for (int rep = 0; rep < kProbeRepeats; ++rep) {
         g_prod.Initialise(kProbeSeed);
         const uint32_t t0 = Cycles();
-        (void)g_prod.Train(0, kProbeLR);
+        golden.eval[rep] = g_prod.Train(0, kProbeLR);
         eval.v[rep] = Cycles() - t0;
     }
     for (int rep = 0; rep < kProbeRepeats; ++rep) {
         g_prod.Initialise(kProbeSeed);
         const uint32_t t0 = Cycles();
-        (void)g_prod.Train(1, kProbeLR);
+        golden.epoch[rep] = g_prod.Train(1, kProbeLR);
         epoch.v[rep] = Cycles() - t0;
     }
 }
@@ -424,6 +462,75 @@ MEML_MLP_CODE void MeasureTrain(Reps & eval, Reps & epoch) {
 MEML_MLP_CODE void RunTrainOnce() {
     g_prod.Initialise(kProbeSeed);
     (void)g_prod.Train(1, kProbeLR);
+}
+
+/// The evaluation pass alone (Initialise + Train(0)), for its own counter
+/// totals: compared between builds it localises a gap to the forward path.
+MEML_MLP_CODE void RunEvalOnce() {
+    g_prod.Initialise(kProbeSeed);
+    (void)g_prod.Train(0, kProbeLR);
+}
+
+// ── Loss stage under three conditions (Step 0e) ──
+// compute_loss reads its label vector from flash (XIP). To separate "the
+// arithmetic" from "the flash read": (i) as production does, labels in flash;
+// (ii) label vector copied to RAM first; (iii) the XIP bus counters around the
+// flash-label call. Real softmax inputs come from a forward pass done untimed.
+struct LossVariants {
+    Stat flash, ram;
+    uint64_t xip[4] = {};   // access, access_contested, stall_upstream, stall_downstream
+};
+
+constexpr uint8_t kXipSel[4] = {
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_ACCESS_CONTESTED,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_UPSTREAM,
+    BUSCTRL_PERFSEL0_VALUE_XIP_MAIN0_STALL_DOWNSTREAM,
+};
+
+MEML_MLP_CODE void RunLossVariants(LossVariants & out) {
+    auto & layer0 = g_net.layer<0>();
+    auto & layer1 = g_net.layer<1>();
+    auto & layer2 = g_net.layer<2>();
+    std::array<dataset::DataType, Net::kMaxWidth> buf_a{}, buf_b{};
+    std::array<dataset::DataType, dataset::kLabelSize> pred{}, deriv{}, label_ram{};
+
+    for (int variant = 0; variant < 3; ++variant) {
+        if (variant == 2) {
+            busctrl_hw->perfctr_en = 0;
+            for (int k = 0; k < 4; ++k) {
+                busctrl_hw->counter[k].sel = kXipSel[k];
+                busctrl_hw->counter[k].value = 0;
+            }
+            busctrl_hw->perfctr_en = 1;
+        }
+        for (int it = 0; it < kIterations; ++it) {
+            const std::size_t s = static_cast<std::size_t>(it) % dataset::kNumExamples;
+            layer0.forward(dataset::features[s].data(), buf_a.data());
+            layer1.forward(buf_a.data(), buf_b.data());
+            layer2.forward(buf_b.data(), pred.data());
+            const dataset::DataType* label = dataset::labels[s].data();
+            if (variant == 1) {
+                for (std::size_t i = 0; i < dataset::kLabelSize; ++i) label_ram[i] = label[i];
+                label = label_ram.data();
+            }
+            uint32_t before[4] = {};
+            if (variant == 2) ReadCounters(before);
+            const uint32_t ints = save_and_disable_interrupts();
+            const uint32_t t0 = Cycles();
+            smlp::compute_loss<loss::LOSS_FUNCTIONS::LOSS_CATEGORICAL_CROSSENTROPY>(
+                label, pred.data(), deriv.data(), dataset::kLabelSize, dataset::DataType(1));
+            const uint32_t dt = Cycles() - t0;
+            restore_interrupts(ints);
+            if (variant == 2) {
+                uint32_t after[4];
+                ReadCounters(after);
+                for (int k = 0; k < 4; ++k) out.xip[k] += static_cast<uint32_t>(after[k] - before[k]);
+            }
+            if (variant == 1) out.ram.add(dt);
+            else if (variant == 0) out.flash.add(dt);
+        }
+    }
 }
 
 /// Everything the probe core does. Runs on core 1 for the core-1-pinned build,
@@ -454,6 +561,9 @@ MEML_MLP_CODE void ProbeBody() {
     static BatchStages batch;
     RunBatchStages(batch);
 
+    static LossVariants loss_var;
+    RunLossVariants(loss_var);
+
     printf("\nForward/backward cycle profile (%d iterations, network 64-64-32-10):\n", kIterations);
     printf("Forward:\n");
     PrintStage("layer0.forward", ref.stage[0]);
@@ -469,6 +579,16 @@ MEML_MLP_CODE void ProbeBody() {
     PrintStage("backward total", ref.bwd_total);
     printf("Full forward+loss+backward total:\n");
     PrintStage("full pass", ref.full_total);
+
+    printf("Loss stage variants (Step 0e; %d iterations, real softmax inputs):\n", kIterations);
+    PrintStage("compute_loss.flash_labels", loss_var.flash);
+    PrintStage("compute_loss.ram_labels", loss_var.ram);
+    {
+        static const char* const kXipNames[4] = {"access", "access_contested", "stall_upstream", "stall_downstream"};
+        for (int k = 0; k < 4; ++k)
+            printf("  xip stage=compute_loss.flash_labels event=%s per_call=%.2f\n", kXipNames[k],
+                   static_cast<double>(loss_var.xip[k]) / static_cast<double>(kIterations));
+    }
 
     printf("Per-batch stages (once per %u samples; %d iterations):\n",
            static_cast<unsigned>(kBatchSize), kBatchIterations);
@@ -502,7 +622,8 @@ MEML_MLP_CODE void ProbeBody() {
 
     // ── Production path: the real facade, on this core, at its real addresses ──
     static Reps eval_reps, epoch_reps;
-    MeasureTrain(eval_reps, epoch_reps);
+    static Golden golden;
+    MeasureTrain(eval_reps, epoch_reps, golden);
 
     const uint32_t eval_min = eval_reps.min();
     const uint32_t epoch_min = epoch_reps.min();
@@ -510,17 +631,31 @@ MEML_MLP_CODE void ProbeBody() {
         (epoch_min - eval_min) / static_cast<uint32_t>(dataset::kNumExamples);
     const uint32_t harness_per_sample =
         static_cast<uint32_t>(ref.full_total.avg()) + batch_per_sample;
-    const uint32_t gap = train_per_sample > harness_per_sample ? train_per_sample - harness_per_sample : 0;
+    // Signed: positive means the production path costs more than the per-layer
+    // harness explains (a code path the harness does not run); Step 0a wants
+    // |gap| < 0.5% of train.epoch_minus_eval_per_sample.
+    const int32_t gap = static_cast<int32_t>(train_per_sample) - static_cast<int32_t>(harness_per_sample);
 
     printf("Production path (MLPOpticalRecognition::Train on this core, min of %d):\n", kProbeRepeats);
     PrintValue("train.eval_pass", eval_min, eval_reps.max());
     PrintValue("train.epoch", epoch_min, epoch_reps.max());
     PrintValue("train.epoch_minus_eval_per_sample", train_per_sample, train_per_sample);
     PrintValue("train.harness_per_sample", harness_per_sample, harness_per_sample);
-    PrintValue("train.unexplained_per_sample", gap, gap);
+    PrintSigned("train.unexplained_per_sample", gap);
     for (int rep = 0; rep < kProbeRepeats; ++rep)
         printf("  train.repeat %d eval_pass=%lu epoch=%lu\n", rep,
                static_cast<unsigned long>(eval_reps.v[rep]), static_cast<unsigned long>(epoch_reps.v[rep]));
+
+    // ── Golden numerics (G0): every run from the same seed must agree to the bit ──
+    bool identical = true;
+    for (int rep = 1; rep < kProbeRepeats; ++rep)
+        identical = identical && SameBits(golden.eval[rep], golden.eval[0]) && SameBits(golden.epoch[rep], golden.epoch[0]);
+    printf("Golden numerics (seed 0x%lx; bit-identical across %d runs: %s):\n",
+           static_cast<unsigned long>(kProbeSeed), kProbeRepeats, identical ? "yes" : "NO");
+    printf("  golden train0 loss=%.9g accuracy=%.9g\n",
+           static_cast<double>(golden.eval[0].loss), static_cast<double>(golden.eval[0].accuracy));
+    printf("  golden train1 loss=%.9g accuracy=%.9g\n",
+           static_cast<double>(golden.epoch[0].loss), static_cast<double>(golden.epoch[0].accuracy));
 
     // ── Production-path contention: whole Train(1) per pass, drained by the service core ──
     printf("Bus contention, production path (totals over Initialise + Train(1); polled from the other core):\n");
@@ -530,6 +665,16 @@ MEML_MLP_CODE void ProbeBody() {
         RunTrainOnce();
         PollStop(totals);
         PrintContention("train.epoch", pass, totals);
+    }
+
+    // ── Evaluation-only contention (Step 0d): Train(0), localises a gap to the forward path ──
+    printf("Bus contention, evaluation pass only (Initialise + Train(0); polled from the other core):\n");
+    for (int pass = 1; pass <= 3; ++pass) {
+        double totals[4];
+        PollStart(pass);
+        RunEvalOnce();
+        PollStop(totals);
+        PrintContention("train.eval_pass", pass, totals);
     }
 
     // ── Poller footprint: counters while the probe core idles and the service core polls ──

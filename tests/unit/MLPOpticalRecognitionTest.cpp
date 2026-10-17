@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #include "pico.h"
 
@@ -59,6 +60,20 @@ UNIT(MLPOpticalRecognitionInitialiseIsDeterministic) {
     ASSERT_TRUE(std::isfinite(first.loss));
     ASSERT_TRUE(first.loss == second.loss);
     ASSERT_TRUE(first.accuracy == second.accuracy);
+    PASS();
+}
+
+UNIT(MLPOpticalRecognitionTrainIsDeterministic) {
+    // Golden numerics G0 rest on this: two one-epoch Train() runs from the
+    // same seed must agree to the bit (not merely within a tolerance).
+    g_experiment.Initialise(kSeed);
+    const MLPOpticalRecognition::Result first = g_experiment.Train(/*epochs=*/1, 0.01f);
+
+    g_experiment.Initialise(kSeed);
+    const MLPOpticalRecognition::Result second = g_experiment.Train(/*epochs=*/1, 0.01f);
+
+    ASSERT_TRUE(std::isfinite(first.loss));
+    ASSERT_TRUE(std::memcmp(&first, &second, sizeof(first)) == 0);
     PASS();
 }
 

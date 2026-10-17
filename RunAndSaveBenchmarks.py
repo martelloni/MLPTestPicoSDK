@@ -68,7 +68,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_SERIAL_PORT = "/dev/tty.usbmodem2101"
+DEFAULT_SERIAL_PORT = "/dev/tty.usbmodem21401"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_PICOTOOL = Path.home() / ".pico-sdk" / "picotool" / "2.3.0" / "picotool" / "picotool"
 DEFAULT_RUN_TIMEOUT_S = 25 * 60  # each run takes ~15 min; leave headroom
@@ -135,6 +135,8 @@ CSV_FIELDS = [
     "correctness_identical",
     "session_losses",
     "session_accuracies",
+    "final_loss",
+    "final_accuracy",
     "timing_avg_diff_pct",
     "timing_max_diff_pct",
     "timing_tolerance_pct",
@@ -178,7 +180,7 @@ PROFILE_CSV_FIELDS = [
 RE_PROFILE_HEADER = re.compile(r"Forward/backward cycle profile \((\d+) iterations")
 # Matches tests/ProfileForwardBackward.cpp's PrintStage() output:
 #   "  %-28s avg=%9.1f cycles   max=%8lu cycles"
-RE_PROFILE_STAGE = re.compile(r"^\s*(\S(?:.*\S)?)\s+avg=\s*([0-9.]+) cycles\s+max=\s*(\d+) cycles\s*$")
+RE_PROFILE_STAGE = re.compile(r"^\s*(\S(?:.*\S)?)\s+avg=\s*(-?[0-9.]+) cycles\s+max=\s*(\d+) cycles\s*$")
 
 
 @dataclass
@@ -453,6 +455,8 @@ def parse_transcript(text: str, build_config: str, timestamp: str, git_commit: s
         return dict(
             session_losses=";".join(loss for loss, _ in found),
             session_accuracies=";".join(acc for _, acc in found),
+            final_loss=found[-1][0] if found else "",
+            final_accuracy=found[-1][1] if found else "",
         )
 
     flood_row = dict(common)
@@ -689,6 +693,7 @@ CONTENTION_CSV_FIELDS = [
     "contested_avg",
     "access_avg",
     "valid",
+    "contested_pct_of_cycles",
     "log_file",
 ]
 
@@ -709,13 +714,34 @@ PER_LAYER_STAGES = {
 }
 
 
-def parse_contention_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+# "  xip stage=<s> event=<e> per_call=<v>" -- XIP (flash) bus events around one call (Step 0e).
+RE_XIP = re.compile(r"^\s*xip stage=(\S+) event=(\S+) per_call=([0-9.]+)\s*$")
+# Stages whose counters are whole-run totals (not per-call averages) and so have a cycle count.
+TRAIN_STAGES = ("train.epoch", "train.eval_pass")
+
+
+def parse_contention_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str,
+                                probe_on_core1: bool = False, cycles_by_stage: dict | None = None) -> list[dict]:
+    """Raw per-bank rows, plus (Step 0c) the arithmetic a reader should never
+    have to do: for every stage with all of banks 0-7, a `group` row (sum of
+    contested counts over the four banks of the group the probe core's data
+    lives in: 0-3, or 4-7 when the probe core is core 1) and an
+    `other_group_total` row (the other four). Train stages also get
+    contested_pct_of_cycles = group / cycles, from `cycles_by_stage`."""
     pass_valid = {}
     merged: dict[tuple[str, int], dict] = {}
+    xip_rows = []
     for line in text.splitlines():
         pm = RE_CONTENTION_PASS.match(line)
         if pm:
             pass_valid[int(pm.group(1))] = pm.group(2) == "yes"
+            continue
+        xm = RE_XIP.match(line)
+        if xm:
+            xip_rows.append(dict(
+                timestamp=timestamp, git_commit=git_commit, build_config=build_config, stage=xm.group(1),
+                sram_bank=f"xip_{xm.group(2)}", contested_avg=xm.group(3), access_avg="", valid="",
+                contested_pct_of_cycles="", log_file=log_file))
             continue
         m = RE_CONTENTION.match(line)
         if not m:
@@ -723,7 +749,8 @@ def parse_contention_transcript(text: str, build_config: str, timestamp: str, gi
         stage, bank, contested, access = m.group(1), int(m.group(2)), m.group(3), m.group(4)
         row = merged.setdefault((stage, bank), dict(
             timestamp=timestamp, git_commit=git_commit, build_config=build_config,
-            stage=stage, sram_bank=str(bank), contested_avg="", access_avg="", valid="", log_file=log_file))
+            stage=stage, sram_bank=str(bank), contested_avg="", access_avg="", valid="",
+            contested_pct_of_cycles="", log_file=log_file))
         if contested != "-":
             row["contested_avg"] = contested
         if access != "-":
@@ -733,11 +760,154 @@ def parse_contention_transcript(text: str, build_config: str, timestamp: str, gi
         if row["stage"] in PER_LAYER_STAGES:
             ok = pass_valid.get(_PASS_OF_BANK[int(row["sram_bank"])], True)
             row["valid"] = "yes" if ok else "NO"
+
+    group_banks = set(range(4, 8)) if probe_on_core1 else set(range(0, 4))
+    other_banks = set(range(0, 8)) - group_banks
+    stages = sorted({stage for stage, _ in merged}, key=lambda st: min(i for i, r in enumerate(rows) if r["stage"] == st))
+    for stage in stages:
+        by_bank = {b: merged[(stage, b)] for (st, b) in merged if st == stage}
+        if not all(b in by_bank and by_bank[b]["contested_avg"] != "" for b in range(8)):
+            continue  # e.g. idle_window (SRAM8/9 contested + SRAM0/4 access only): no group arithmetic
+        group = sum(float(by_bank[b]["contested_avg"]) for b in group_banks)
+        other = sum(float(by_bank[b]["contested_avg"]) for b in other_banks)
+        valid = "NO" if any(by_bank[b]["valid"] == "NO" for b in range(8)) else by_bank[0]["valid"]
+        base = dict(timestamp=timestamp, git_commit=git_commit, build_config=build_config, stage=stage,
+                    access_avg="", valid=valid, contested_pct_of_cycles="", log_file=log_file)
+        pct = ""
+        cycles = (cycles_by_stage or {}).get(stage)
+        if stage in TRAIN_STAGES and cycles:
+            pct = f"{100.0 * group / cycles:.4f}"
+        rows.append(dict(base, sram_bank="group", contested_avg=f"{group:.1f}", contested_pct_of_cycles=pct))
+        rows.append(dict(base, sram_bank="other_group_total", contested_avg=f"{other:.1f}"))
+    return rows + xip_rows
+
+
+# "  golden train1 loss=0.123 accuracy=0.9" / "Golden numerics (seed 0x.. ; bit-identical across 3 runs: yes)"
+RE_GOLDEN = re.compile(r"^\s*golden (train\d) loss=(\S+) accuracy=(\S+)\s*$")
+RE_GOLDEN_IDENTICAL = re.compile(r"Golden numerics .*bit-identical across \d+ runs: (yes|NO)")
+GOLDEN_CSV_FIELDS = ["timestamp", "git_commit", "build_config", "source", "loss", "accuracy", "repeats_identical", "log_file"]
+GOLDEN_CSV_PATH = RESULTS_DIR / "golden_results.csv"
+
+
+def parse_golden_transcript(text: str, build_config: str, timestamp: str, git_commit: str, log_file: str) -> list[dict]:
+    ident = RE_GOLDEN_IDENTICAL.search(text)
+    rows = []
+    for line in text.splitlines():
+        m = RE_GOLDEN.match(line)
+        if m:
+            rows.append(dict(timestamp=timestamp, git_commit=git_commit, build_config=build_config,
+                             source=f"profile.{m.group(1)}", loss=m.group(2), accuracy=m.group(3),
+                             repeats_identical=ident.group(1) if ident else "", log_file=log_file))
     return rows
+
+
+def append_golden_rows_to_csv(rows: list) -> None:
+    RESULTS_DIR.mkdir(exist_ok=True)
+    csv_is_new = not GOLDEN_CSV_PATH.exists()
+    with open(GOLDEN_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
+        writer = csv.DictWriter(csv_f, fieldnames=GOLDEN_CSV_FIELDS)
+        if csv_is_new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def check_golden_across_builds(golden_by_build: dict) -> bool:
+    """G0: the same arithmetic on every build, so loss/accuracy must agree
+    exactly. `golden_by_build` maps build name -> {source: (loss, accuracy)}
+    (profile Train() results and the benchmark's per-session values)."""
+    ok = True
+    sources = sorted({src for d in golden_by_build.values() for src in d})
+    for src in sources:
+        vals = {b: d[src] for b, d in golden_by_build.items() if src in d}
+        if len(set(vals.values())) > 1:
+            ok = False
+            log(f"GOLDEN MISMATCH for {src}: " + "; ".join(f"{b}={v}" for b, v in vals.items()))
+        elif len(vals) > 1:
+            log(f"Golden G0 {src}: identical across {', '.join(vals)}: loss/accuracy={next(iter(vals.values()))}")
+    return ok
+
+
+def profile_cycles(profile_rows: list) -> dict:
+    return {r["stage"]: float(r["avg_cycles"]) for r in profile_rows}
+
+
+def check_unexplained(profile_rows: list, build: str) -> bool:
+    """Step 0a acceptance: the per-layer harness (full pass + per-batch work)
+    must explain train.epoch_minus_eval_per_sample to within 0.5%."""
+    c = profile_cycles(profile_rows)
+    prod = c.get("train.epoch_minus_eval_per_sample")
+    gap = c.get("train.unexplained_per_sample")
+    if not prod or gap is None:
+        log(f"{build}: train.* rows missing; cannot check train.unexplained_per_sample")
+        return False
+    pct = 100.0 * abs(gap) / prod
+    ok = pct <= 0.5
+    log(f"{build}: train.unexplained_per_sample = {gap:+.0f} cycles ({pct:.3f}% of {prod:.0f}) -- "
+        f"{'OK (<=0.5%)' if ok else 'FAIL: the harness does not run all of the production path'}")
+    return ok
+
+
+def contested_pct_rows(contention_rows: list) -> dict:
+    """{stage: group contested total} for the train stages of one build."""
+    return {r["stage"]: float(r["contested_avg"]) for r in contention_rows
+            if r["sram_bank"] == "group" and r["stage"] in TRAIN_STAGES}
+
+
+def cycles_per_contested_rows(per_build: dict, timestamp: str, git_commit: str) -> list[dict]:
+    """Step 0d: for each pair of builds and each train stage, (cycle difference)
+    / (group-contested difference). One contested access costs one cycle, so
+    this should be about 1.0 wherever the contested counts differ enough to
+    mean something. `per_build[name] = (cycles_by_stage, group_contested_by_stage)`."""
+    rows = []
+    names = sorted(per_build)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            for stage in TRAIN_STAGES:
+                try:
+                    dc = per_build[a][0][stage] - per_build[b][0][stage]
+                    dn = per_build[a][1][stage] - per_build[b][1][stage]
+                except KeyError:
+                    continue
+                if abs(dn) < 1000:
+                    log(f"cycles_per_contested {stage} {a}-{b}: contested counts differ by only {dn:.0f}; not meaningful")
+                    continue
+                ratio = dc / dn
+                log(f"cycles_per_contested {stage} {a}-{b}: {dc:.0f} cycles / {dn:.0f} contested = {ratio:.3f}")
+                rows.append(dict(timestamp=timestamp, git_commit=git_commit, build_config=f"{a}-{b}", stage=stage,
+                                 sram_bank="cycles_per_contested", contested_avg=f"{ratio:.4f}", access_avg="",
+                                 valid="", contested_pct_of_cycles="", log_file=""))
+    return rows
+
+
+def check_repeatability(runs: list, build: str) -> bool:
+    """Step 0h: repeats of the same profile must agree on cycles within 0.1%
+    and on group-contested totals within 1%, or the counters are unusable.
+    `runs` is a list of (profile_rows, contention_rows)."""
+    if len(runs) < 2:
+        return True
+    ok = True
+    cyc = [profile_cycles(p) for p, _ in runs]
+    for stage in cyc[0]:
+        if stage == "train.unexplained_per_sample" or stage.startswith("train.repeat"):
+            continue
+        vals = [c[stage] for c in cyc if stage in c]
+        lo, hi = min(vals), max(vals)
+        if lo > 0 and (hi - lo) / lo > 0.001:
+            ok = False
+            log(f"{build}: {stage} cycles not repeatable: {lo:.1f}..{hi:.1f} ({100*(hi-lo)/lo:.3f}% > 0.1%)")
+    grp = [contested_pct_rows(c) for _, c in runs]
+    for stage in TRAIN_STAGES:
+        vals = [g[stage] for g in grp if stage in g]
+        if len(vals) > 1 and min(vals) > 0 and (max(vals) - min(vals)) / min(vals) > 0.01:
+            ok = False
+            log(f"{build}: {stage} group contested not repeatable: {min(vals):.0f}..{max(vals):.0f} (>1%)")
+    log(f"{build}: repeatability over {len(runs)} runs: {'OK' if ok else 'FAIL'}")
+    return ok
 
 
 def append_contention_rows_to_csv(rows: list) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
+    migrate_csv_header(CONTENTION_CSV_PATH, CONTENTION_CSV_FIELDS)
     csv_is_new = not CONTENTION_CSV_PATH.exists()
     with open(CONTENTION_CSV_PATH, "a", newline="", encoding="utf-8") as csv_f:
         writer = csv.DictWriter(csv_f, fieldnames=CONTENTION_CSV_FIELDS)
@@ -819,6 +989,11 @@ Backward:
   backward total               avg=   2259.0 cycles   max=    2360 cycles
 Full forward+loss+backward total:
   full pass                    avg=   4230.3 cycles   max=    4470 cycles
+Loss stage variants (Step 0e; 100 iterations, real softmax inputs):
+  compute_loss.flash_labels    avg=   1137.0 cycles   max=    1200 cycles
+  compute_loss.ram_labels      avg=    752.0 cycles   max=     800 cycles
+  xip stage=compute_loss.flash_labels event=access per_call=12.00
+  xip stage=compute_loss.flash_labels event=stall_upstream per_call=40.50
 Per-batch stages (once per 128 samples; 20 iterations):
   batch.zero_grads             avg=    900.0 cycles   max=     900 cycles
   batch.grad_norm              avg=   1500.5 cycles   max=    1510 cycles
@@ -841,8 +1016,33 @@ Production path (MLPOpticalRecognition::Train on this core, min of 3):
   train.eval_pass              avg=154881639.0 cycles   max=154917299 cycles
   train.epoch                  avg=757294578.0 cycles   max=757294848 cycles
   train.epoch_minus_eval_per_sample avg= 157575.0 cycles   max=  157575 cycles
+  train.harness_per_sample     avg=  157000.0 cycles   max=  157000 cycles
+  train.unexplained_per_sample avg=    -575.0 cycles   max=     575 cycles
+Golden numerics (seed 0xc0de; bit-identical across 3 runs: yes):
+  golden train0 loss=2.30258512 accuracy=0.100000001
+  golden train1 loss=1.5 accuracy=0.5
 Bus contention, production path (totals over Initialise + Train(1); polled from the other core):
-  contention stage=train.epoch bank=SRAM4 contested=12466738.0 access=-
+  contention stage=train.epoch bank=SRAM0 contested=1000.0 access=-
+  contention stage=train.epoch bank=SRAM1 contested=2000.0 access=-
+  contention stage=train.epoch bank=SRAM2 contested=3000.0 access=-
+  contention stage=train.epoch bank=SRAM3 contested=4000.0 access=-
+  contention stage=train.epoch bank=SRAM4 contested=5000000.0 access=-
+  contention stage=train.epoch bank=SRAM5 contested=6000000.0 access=-
+  contention stage=train.epoch bank=SRAM6 contested=7000000.0 access=-
+  contention stage=train.epoch bank=SRAM7 contested=8000000.0 access=-
+  contention stage=train.epoch bank=SRAM8 contested=10.0 access=-
+  contention stage=train.epoch bank=SRAM9 contested=20.0 access=-
+Bus contention, evaluation pass only (Initialise + Train(0); polled from the other core):
+  contention stage=train.eval_pass bank=SRAM0 contested=100.0 access=-
+  contention stage=train.eval_pass bank=SRAM1 contested=200.0 access=-
+  contention stage=train.eval_pass bank=SRAM2 contested=300.0 access=-
+  contention stage=train.eval_pass bank=SRAM3 contested=400.0 access=-
+  contention stage=train.eval_pass bank=SRAM4 contested=500000.0 access=-
+  contention stage=train.eval_pass bank=SRAM5 contested=600000.0 access=-
+  contention stage=train.eval_pass bank=SRAM6 contested=700000.0 access=-
+  contention stage=train.eval_pass bank=SRAM7 contested=800000.0 access=-
+  contention stage=train.eval_pass bank=SRAM8 contested=1.0 access=-
+  contention stage=train.eval_pass bank=SRAM9 contested=2.0 access=-
 Placement (net and kernel code addresses; code addresses are added by
 RunAndSaveBenchmarks.py from the ELF symbol table):
   placement data net                          addr=0x20008a30 mod16=0
@@ -878,30 +1078,60 @@ def run_self_test() -> None:
     profile_rows = parse_profile_transcript(
         SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
     )
-    assert len(profile_rows) == 21
+    by_stage = {r["stage"]: r for r in profile_rows}
     assert profile_rows[0]["stage"] == "layer0.forward"
     assert profile_rows[0]["avg_cycles"] == "1234.5"
     assert profile_rows[0]["max_cycles"] == "1300"
     assert profile_rows[0]["iterations"] == "100"
-    assert profile_rows[9]["stage"] == "full pass"
-    assert profile_rows[9]["max_cycles"] == "4470"
-    assert profile_rows[17]["stage"] == "batch total per sample"
-    assert profile_rows[15]["stage"] == "batch.rmsprop total"
-    assert profile_rows[-1]["stage"] == "train.epoch_minus_eval_per_sample"
-    assert profile_rows[-3]["stage"] == "train.eval_pass"
-    assert profile_rows[-2]["avg_cycles"] == "757294578.0"
+    assert by_stage["full pass"]["max_cycles"] == "4470"
+    assert by_stage["compute_loss.ram_labels"]["avg_cycles"] == "752.0"
+    assert by_stage["batch total per sample"]["avg_cycles"] == "1128.0"
+    assert by_stage["train.unexplained_per_sample"]["avg_cycles"] == "-575.0"  # signed
+    assert profile_rows[-1]["stage"] == "train.unexplained_per_sample"
+    assert by_stage["train.epoch"]["avg_cycles"] == "757294578.0"
+    assert check_unexplained(profile_rows, "selftest")  # 575 / 157575 = 0.36%
 
-    contention_rows = parse_contention_transcript(
-        SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log"
-    )
-    by_key = {(r["stage"], r["sram_bank"]): r for r in contention_rows}
-    assert by_key[("layer1.forward", "3")]["contested_avg"] == "12.5"
-    assert by_key[("layer1.forward", "3")]["valid"] == "yes"
-    assert by_key[("layer1.forward", "4")]["valid"] == "NO"  # pass 2 drifted
-    assert by_key[("layer1.forward", "0")]["contested_avg"] == "0.0"  # pass 1 contested ...
-    assert by_key[("layer1.forward", "0")]["access_avg"] == "77.0"    # ... merged with pass 3 access
-    assert by_key[("train.epoch", "4")]["contested_avg"] == "12466738.0"
-    assert by_key[("train.epoch", "4")]["valid"] == ""
+    # pinned (core 0 / naive): group = banks 0-3; core 1: group = banks 4-7
+    cycles = profile_cycles(profile_rows)
+    c0 = parse_contention_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef",
+                                     "sample_profile.log", probe_on_core1=False, cycles_by_stage=cycles)
+    c1 = parse_contention_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core1", "20260101_000000", "deadbeef",
+                                     "sample_profile.log", probe_on_core1=True, cycles_by_stage=cycles)
+    k0 = {(r["stage"], r["sram_bank"]): r for r in c0}
+    k1 = {(r["stage"], r["sram_bank"]): r for r in c1}
+    assert k0[("train.epoch", "group")]["contested_avg"] == "10000.0"
+    assert k0[("train.epoch", "other_group_total")]["contested_avg"] == "26000000.0"
+    assert k1[("train.epoch", "group")]["contested_avg"] == "26000000.0"   # counts live in banks 4-7
+    assert k1[("train.epoch", "other_group_total")]["contested_avg"] == "10000.0"
+    assert k1[("train.eval_pass", "group")]["contested_avg"] == "2600000.0"
+    assert k1[("train.epoch", "group")]["contested_pct_of_cycles"] == f"{100.0 * 26000000.0 / 757294578.0:.4f}"
+    assert k0[("train.eval_pass", "group")]["contested_pct_of_cycles"] == f"{100.0 * 1000.0 / 154881639.0:.4f}"
+    assert ("layer1.forward", "group") not in k0  # only banks 0,3,4,8 present: no group arithmetic
+    assert k0[("compute_loss.flash_labels", "xip_stall_upstream")]["contested_avg"] == "40.50"
+    # the raw per-bank rows still parse as before
+    assert k0[("layer1.forward", "3")]["contested_avg"] == "12.5"
+    assert k0[("layer1.forward", "3")]["valid"] == "yes"
+    assert k0[("layer1.forward", "4")]["valid"] == "NO"  # pass 2 drifted
+    assert k0[("layer1.forward", "0")]["contested_avg"] == "0.0"  # pass 1 contested ...
+    assert k0[("layer1.forward", "0")]["access_avg"] == "77.0"    # ... merged with pass 3 access
+    assert k0[("train.epoch", "4")]["contested_avg"] == "5000000.0"
+    assert k0[("train.epoch", "4")]["valid"] == ""
+
+    per_build = {"core0": (cycles, contested_pct_rows(c0)), "core1": ({"train.eval_pass": 154881639.0 - 1_800_000.0,
+                 "train.epoch": 757294578.0 - 9_000_000.0}, {"train.eval_pass": 1_000_000.0, "train.epoch": 12_000_000.0})}
+    cpc = cycles_per_contested_rows(per_build, "20260101_000000", "deadbeef")
+    assert len(cpc) == 2 and cpc[0]["sram_bank"] == "cycles_per_contested"
+
+    golden = parse_golden_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core0", "20260101_000000", "deadbeef", "sample_profile.log")
+    assert [g["source"] for g in golden] == ["profile.train0", "profile.train1"]
+    assert golden[0]["loss"] == "2.30258512" and golden[0]["repeats_identical"] == "yes"
+    assert check_golden_across_builds({"a": {"x": ("1", "2")}, "b": {"x": ("1", "2")}})
+    assert not check_golden_across_builds({"a": {"x": ("1", "2")}, "b": {"x": ("1", "3")}})
+
+    cont = parse_contention_transcript(SAMPLE_PROFILE_TRANSCRIPT, "core0", "t", "c", "l")
+    assert check_repeatability([(profile_rows, cont), (profile_rows, cont)], "selftest")
+    drift = [dict(r, avg_cycles=str(float(r["avg_cycles"]) * 1.01)) if r["stage"] == "full pass" else r for r in profile_rows]
+    assert not check_repeatability([(profile_rows, cont), (drift, cont)], "selftest")
 
     sample_dis = """\
 20000000 <test::profile::(anonymous namespace)::RunLayerPass(int, LayerPass&)>:
@@ -926,7 +1156,7 @@ def run_self_test() -> None:
     assert placement_rows[1]["address"] == "0x20008a34"
     assert placement_rows[1]["bank"] == "core0-bank"
 
-    log("Self-test OK: parser correctly extracts pinned, naive, profile, placement, contention and loop data.")
+    log("Self-test OK: parser correctly extracts pinned, naive, profile, placement, contention (incl. per-group totals), golden and loop data.")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -952,6 +1182,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--profile-timeout", type=float, default=DEFAULT_PROFILE_TIMEOUT_S,
         help="Max seconds to wait for one flashed profile run to print its 'full pass' stats line",
+    )
+    parser.add_argument(
+        "--profile-repeats", type=int, default=1,
+        help="Flash and run each profile build this many times, then check the runs agree (cycles within "
+             "0.1%%, group-contested totals within 1%%; Step 0h needs 2)",
     )
     parser.add_argument(
         "--skip-profile", action="store_true",
@@ -1014,6 +1249,8 @@ def main(argv=None) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     configs_by_name = {c.name: c for c in BUILD_CONFIGS + BASELINE_BUILD_CONFIGS}
+    golden_by_build: dict = {}
+    per_build_contention: dict = {}
     profile_configs_by_name = {c.name: c for c in PROFILE_BUILD_CONFIGS}
     for name in args.configs:
         if not args.skip_benchmark:
@@ -1038,6 +1275,9 @@ def main(argv=None) -> int:
 
             rows = parse_transcript(transcript, cfg.name, timestamp, git_commit, str(log_path.relative_to(REPO_ROOT)))
             append_rows_to_csv(rows)
+            for r in rows if cfg.engine == "static" else []:
+                golden_by_build.setdefault(cfg.name, {})[f"benchmark.{r['condition']}"] = (
+                    r["session_losses"], r["session_accuracies"])
             log(f"Saved {len(rows)} row(s) for {cfg.name} to {CSV_PATH}; raw log at {log_path}")
 
         if args.skip_profile:
@@ -1056,40 +1296,64 @@ def main(argv=None) -> int:
         if not profile_cfg.elf_path.exists():
             sys.exit(f"Expected built ELF not found: {profile_cfg.elf_path}")
 
-        profile_timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        profile_log_path = LOG_DIR / f"{profile_cfg.name}_profile_{profile_timestamp}.log"
+        probe_on_core1 = profile_cfg.core_value == "1"
+        runs = []
+        for repeat in range(args.profile_repeats):
+            profile_timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            profile_log_path = LOG_DIR / f"{profile_cfg.name}_profile_{profile_timestamp}.log"
 
-        if not args.skip_flash:
-            flash(picotool, profile_cfg.elf_path)
+            if not args.skip_flash:
+                flash(picotool, profile_cfg.elf_path)
 
-        log(f"Waiting for board on {args.serial_port} (timeout {args.profile_timeout:.0f}s)...")
-        profile_transcript = capture_run(
-            args.serial_port, args.baudrate, args.profile_timeout, profile_log_path,
-            start_marker=PROFILE_STARTED_MARKER, end_marker=PROFILE_END_MARKER,
-        )
+            log(f"Waiting for board on {args.serial_port} (timeout {args.profile_timeout:.0f}s)"
+                f"{f' [repeat {repeat + 1}/{args.profile_repeats}]' if args.profile_repeats > 1 else ''}...")
+            profile_transcript = capture_run(
+                args.serial_port, args.baudrate, args.profile_timeout, profile_log_path,
+                start_marker=PROFILE_STARTED_MARKER, end_marker=PROFILE_END_MARKER,
+            )
 
-        profile_rows = parse_profile_transcript(
-            profile_transcript, profile_cfg.name, profile_timestamp, git_commit,
-            str(profile_log_path.relative_to(REPO_ROOT)),
-        )
-        append_profile_rows_to_csv(profile_rows)
-        profile_log_rel = str(profile_log_path.relative_to(REPO_ROOT))
-        placement_rows = parse_placement_transcript(
-            profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
-        placement_rows += elf_code_placement_rows(
-            profile_cfg.elf_path, find_nm(profile_cfg.build_dir), profile_cfg.name,
-            profile_timestamp, git_commit, profile_log_rel, objdump=find_tool(profile_cfg.build_dir, "CMAKE_OBJDUMP", "arm-none-eabi-objdump"))
-        append_placement_rows_to_csv(placement_rows)
-        contention_rows = parse_contention_transcript(
-            profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
-        append_contention_rows_to_csv(contention_rows)
-        invalid = [r for r in contention_rows if r["valid"] == "NO"]
-        if invalid:
-            log(f"WARNING: {len(invalid)} per-layer contention row(s) came from a pass whose cycle count drifted "
-                f">0.1% from the counter-free reference; discard them and re-run")
-        log(f"Saved {len(contention_rows)} contention row(s) to {CONTENTION_CSV_PATH}")
-        log(f"Saved {len(placement_rows)} placement row(s) for {profile_cfg.name} to {PLACEMENT_CSV_PATH}")
-        log(f"Saved {len(profile_rows)} row(s) for {profile_cfg.name} to {PROFILE_CSV_PATH}; raw log at {profile_log_path}")
+            profile_log_rel = str(profile_log_path.relative_to(REPO_ROOT))
+            profile_rows = parse_profile_transcript(
+                profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
+            append_profile_rows_to_csv(profile_rows)
+            placement_rows = parse_placement_transcript(
+                profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
+            placement_rows += elf_code_placement_rows(
+                profile_cfg.elf_path, find_nm(profile_cfg.build_dir), profile_cfg.name,
+                profile_timestamp, git_commit, profile_log_rel, objdump=find_tool(profile_cfg.build_dir, "CMAKE_OBJDUMP", "arm-none-eabi-objdump"))
+            append_placement_rows_to_csv(placement_rows)
+            cycles = profile_cycles(profile_rows)
+            contention_rows = parse_contention_transcript(
+                profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel,
+                probe_on_core1=probe_on_core1, cycles_by_stage=cycles)
+            append_contention_rows_to_csv(contention_rows)
+            golden_rows = parse_golden_transcript(
+                profile_transcript, profile_cfg.name, profile_timestamp, git_commit, profile_log_rel)
+            append_golden_rows_to_csv(golden_rows)
+            if any(r["repeats_identical"] == "NO" for r in golden_rows):
+                log(f"WARNING: {profile_cfg.name}: repeated Train() runs from one seed were NOT bit-identical")
+            check_unexplained(profile_rows, profile_cfg.name)
+            invalid = [r for r in contention_rows if r["valid"] == "NO"]
+            if invalid:
+                log(f"WARNING: {len(invalid)} per-layer contention row(s) came from a pass whose cycle count drifted "
+                    f">0.1% from the counter-free reference; discard them and re-run")
+            log(f"Saved {len(contention_rows)} contention row(s) to {CONTENTION_CSV_PATH}")
+            log(f"Saved {len(placement_rows)} placement row(s) for {profile_cfg.name} to {PLACEMENT_CSV_PATH}")
+            log(f"Saved {len(profile_rows)} row(s) for {profile_cfg.name} to {PROFILE_CSV_PATH}; raw log at {profile_log_path}")
+            runs.append((profile_rows, contention_rows))
+            for r in golden_rows:
+                golden_by_build.setdefault(profile_cfg.name, {})[r["source"]] = (r["loss"], r["accuracy"])
+
+        check_repeatability(runs, profile_cfg.name)
+        last_profile, last_contention = runs[-1]
+        per_build_contention[profile_cfg.name] = (profile_cycles(last_profile), contested_pct_rows(last_contention))
+
+    if len(per_build_contention) > 1:
+        derived = cycles_per_contested_rows(per_build_contention, dt.datetime.now().strftime("%Y%m%d_%H%M%S"), git_commit)
+        if derived:
+            append_contention_rows_to_csv(derived)
+    if len(golden_by_build) > 1:
+        check_golden_across_builds(golden_by_build)
 
     result_paths = []
     if not args.skip_benchmark:
@@ -1098,6 +1362,7 @@ def main(argv=None) -> int:
         result_paths.append(str(PROFILE_CSV_PATH))
         result_paths.append(str(PLACEMENT_CSV_PATH))
         result_paths.append(str(CONTENTION_CSV_PATH))
+        result_paths.append(str(GOLDEN_CSV_PATH))
     log(f"\nAll done. Results in {' and '.join(result_paths)}")
     return 0
 

@@ -386,6 +386,36 @@ def check_mlp_inlining_canary(symbols, errors):
                 break
 
 
+_SINGLE_COPY_KERNELS = ("forward", "AccumulateGradients", "ApplyAccumulatedGradients")
+_CLONE_SUFFIX = re.compile(r"\.(constprop|isra|part|cold|clone|localalias)")
+
+
+def check_single_kernel_copies(symbols, errors):
+    """Step 0a: each StaticLayer kernel (forward, AccumulateGradients,
+    ApplyAccumulatedGradients) must exist exactly once per layer shape, so the
+    profile harness and MLPOpticalRecognition::Train execute the very same
+    code. A second copy (a .constprop/.isra/.part clone) means the per-layer
+    profile rows describe code the benchmark does not run. The kernels are
+    marked noinline, noclone.
+    """
+    seen = {}
+    for addr, name in symbols:
+        if "StaticLayer" not in name or not name.startswith(_MLP_SYMBOL_PREFIXES):
+            continue
+        base = _CLONE_SUFFIX.split(name)[0]
+        if not any(("%d%s" % (len(k), k)) in base for k in _SINGLE_COPY_KERNELS):
+            continue
+        if _CLONE_SUFFIX.search(name):
+            fail(errors, f"kernel clone '{name}' at {addr:#x}: StaticLayer kernels must have one copy "
+                         "(noinline, noclone) so the harness and Train run the same code")
+        seen.setdefault(base, []).append(addr)
+    for base, addrs in seen.items():
+        if len(addrs) > 1:
+            fail(errors, f"kernel '{base}' defined {len(addrs)} times ({', '.join(hex(a) for a in addrs)})")
+    if not seen:
+        fail(errors, "no StaticLayer kernel symbols found -- single-copy check cannot run")
+
+
 def check_placement_probe(symbols, core, errors):
     expected_lo, expected_hi = (RAM1_BASE, RAM1_END) if core == "1" else (RAM0_BASE, RAM0_END)
     # MLPOpticalRecognitionTest.cpp's g_experiment is the real experiment's
@@ -512,6 +542,7 @@ def main():
         check_mlp_symbol_placement(symbols, args.core, errors)
         check_mlp_entry_points(symbols, args.core, errors, args.mode)
         check_callee_closure(nm_output, run(args.objdump, ["-d", args.elf]), args.core, errors)
+        check_single_kernel_copies(symbols, errors)
     else:
         check_bank_bounds(sections, ".core0_bank", RAM0_BASE, RAM0_END, errors)
         for name in CORE1_SECTIONS:
@@ -524,6 +555,7 @@ def main():
             check_mlp_symbol_placement(symbols, args.core, errors)
             check_mlp_entry_points(symbols, args.core, errors, args.mode)
             check_callee_closure(nm_output, run(args.objdump, ["-d", args.elf]), args.core, errors)
+            check_single_kernel_copies(symbols, errors)
         if args.mode == "tests":
             check_placement_probe(symbols, args.core, errors)
         else:
